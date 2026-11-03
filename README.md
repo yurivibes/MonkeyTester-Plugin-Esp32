@@ -76,9 +76,10 @@ See [ACTIONS.md](ACTIONS.md) for the four actions (`flash`, `reset`, `expect`,
   directory is a path on the plugin's host; when VisualTester runs elsewhere it
   can `POST /uploads` a zip of it and pass `upload:<id>` instead.
 - **expect** is a relay: the test's inline block goes to the board line by line
-  as response rules, replacing the previous ones. The plugin doesn't know the
-  rule language; the firmware does. A new failure case is a few lines in a test,
-  with no plugin change.
+  as response rules. A block states only what changes; earlier rules stay until
+  overridden, undone with `-> normal`, or dropped with `clear`. The plugin
+  doesn't know the rule language; the firmware does. A new failure case is a few
+  lines in a test, with no plugin change.
 - **clear** puts the board back to normal behaviour.
 
 Job outcomes follow the contract: `passed`; `failed` when the board rejected a

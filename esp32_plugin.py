@@ -310,11 +310,12 @@ class Esp32Plugin(Plugin):
                    {"wait_ready": Param("bool", "require the VT ready line", default=True)},
                    default_timeout_ms=30_000),
             Action("expect",
-                   "Replace the board's expectations: clear them, then load each line of "
-                   "`script` as a rule (how the board answers the app). The rule language is "
-                   "the firmware's (TemperatureSensor docs/vt-control.md); blank and # lines "
-                   "are skipped. Fails on the first line the board rejects, and leaves the "
-                   "board cleared.",
+                   "Apply changes to how the board answers the app: each line of `script` is "
+                   "sent as a rule, on top of the rules already loaded (state only what "
+                   "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
+                   "The rule language is the firmware's (TemperatureSensor "
+                   "docs/vt-control.md); blank and # lines are skipped. Stops at the first "
+                   "line the board rejects.",
                    self.act_expect,
                    {"script": Param("string", "rule lines, one per line (the test's inline "
                                     "block)", required=True)},
@@ -395,29 +396,29 @@ class Esp32Plugin(Plugin):
         return {}
 
     def act_expect(self, ctx: JobContext, p: dict):
+        """Apply a block of changes. Nothing is cleared first: rules accumulate on
+        the board until a later block overrides them, `-> normal` removes one, or
+        `clear` drops them all."""
         b: Board = ctx.device
         rules = [ln.strip() for ln in p["script"].splitlines()]
         rules = [ln for ln in rules if ln and not ln.startswith("#")]
         if not rules:
-            raise ActionError("script has no rules (use `clear` to drop expectations)",
-                              code="bad_request")
-        b.command(ctx, "clear")
-        count = 0
+            raise ActionError("script has no rules", code="bad_request")
+        count = None
         for n, rule in enumerate(rules, 1):
             reply = b.request(ctx, "rule " + rule)
             if not reply.ok:
                 msg = (reply.payload.get("error") if isinstance(reply.payload, dict)
                        else reply.payload)
-                try:  # don't leave half a script loaded
-                    b.command(ctx, "clear")
-                except ActionFailed:
-                    pass
-                raise ActionFailed(f"rule {n} rejected by the board: {msg}: {rule}",
-                                   code="rule_rejected",
-                                   result={"line": n, "rule": rule, "error": msg})
+                raise ActionFailed(
+                    f"rule {n} rejected by the board: {msg}: {rule} "
+                    f"(lines 1-{n - 1} of this block were applied)" if n > 1 else
+                    f"rule {n} rejected by the board: {msg}: {rule}",
+                    code="rule_rejected",
+                    result={"line": n, "rule": rule, "error": msg, "applied": n - 1})
             if isinstance(reply.payload, dict):
                 count = reply.payload.get("rules", count)
-        return {"rules": count, "lines": len(rules)}
+        return {"rules": count, "applied": len(rules)}
 
     def act_clear(self, ctx: JobContext, p: dict):
         return ctx.device.command(ctx, "clear")
