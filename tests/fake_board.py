@@ -81,9 +81,12 @@ class FakeFirmware:
             raise ValueError("bad method")
         resp = line.split("->", 1)[1].strip()
         head = resp.split()[0]
-        if head != "hang" and head != "delay":
+        if head not in ("hang", "delay", "normal"):
             if not head.isdigit() or not 100 <= int(head) <= 599:
                 raise ValueError("bad status")
+        if head == "normal":
+            self.rules.pop((method, path), None)
+            return
         if (method, path) not in self.rules and len(self.rules) >= 16:
             raise ValueError("too many rules")
         self.rules[(method, path)] = resp

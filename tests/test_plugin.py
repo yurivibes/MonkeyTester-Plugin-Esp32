@@ -247,32 +247,40 @@ class ActionTests(unittest.TestCase):
         wifi off
     """
 
-    def test_expect_loads_rules_in_order(self):
+    def test_expect_sends_each_rule_in_order(self):
         job = self.h.run("expect", {"script": self.SCRIPT})
         self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(job["result"], {"rules": 2, "lines": 3})
+        self.assertEqual(job["result"], {"rules": 2, "applied": 3})
         sent = [l.split(" ", 2)[2] for l in self.fw.received if l.startswith("@vt p")]
-        self.assertEqual(sent[-4:], [
-            "clear",
+        self.assertEqual(sent[-3:], [
             'rule GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,'
             '"ok":false,"err":1}',
             "rule POST /setup -> 500",
             "rule wifi off"])
+        self.assertNotIn("clear", sent)
         self.assertEqual(self.fw.wifi, "off")
 
-    def test_expect_replaces_previous_expectations(self):
-        self.h.run("expect", {"script": "GET /a -> 500\nGET /b -> 500"})
-        job = self.h.run("expect", {"script": "GET /c -> hang"})
+    def test_blocks_only_state_what_changes(self):
+        self.h.run("expect", {"script": "GET /a -> 500\nGET /b -> 500\nmqtt off"})
+        # the next block changes /a only; /b and mqtt stay as they were
+        job = self.h.run("expect", {"script": "GET /a -> hang"})
         self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(list(self.fw.rules), [("GET", "/c")])
+        self.assertEqual(self.fw.rules, {("GET", "/a"): "hang", ("GET", "/b"): "500"})
+        self.assertEqual(self.fw.mqtt, "off")
+        # and `-> normal` undoes a single rule
+        job = self.h.run("expect", {"script": "GET /b -> normal"})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(job["result"]["rules"], 1)
+        self.assertEqual(self.fw.rules, {("GET", "/a"): "hang"})
 
-    def test_rejected_rule_fails_and_clears(self):
+    def test_rejected_rule_stops_and_keeps_earlier_state(self):
+        self.h.run("expect", {"script": "GET /old -> 500"})
         job = self.h.run("expect", {"script": "GET /a -> 500\nGET /b => 500\nGET /c -> 500"})
         self.assertEqual(job["state"], "failed")
         self.assertEqual(job["error"]["code"], "rule_rejected")
-        self.assertEqual(job["result"]["line"], 2)
+        self.assertEqual((job["result"]["line"], job["result"]["applied"]), (2, 1))
         self.assertIn("GET /b => 500", job["error"]["message"])
-        self.assertEqual(self.fw.rules, {})
+        self.assertEqual(set(self.fw.rules), {("GET", "/old"), ("GET", "/a")})
         self.assertNotIn("rule GET /c -> 500", " ".join(self.fw.received))
 
     def test_empty_script_is_error(self):
