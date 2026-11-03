@@ -10,14 +10,14 @@ Device Plugin API. See README.md.
   `PLUGIN_API.md` from the VisualTester repo. Don't add or change endpoints,
   job states or fields here without changing that document first (and bumping
   `contract_version` for breaking changes).
-- **The device protocol is owned by the firmware.** Board commands follow
-  `docs/vt-control.md` in TemperatureSensor. New primitives go there first;
-  scenarios built from existing primitives only need `scenarios.json`.
+- **The device protocol is owned by the firmware.** Board commands and the rule
+  language follow `docs/vt-control.md` in TemperatureSensor. `expect` relays rule
+  lines without interpreting them; don't add parsing or validation of rules here.
 - **Must run on Linux and macOS.** No Linux-only paths or tools in code paths
   (port globs are per-OS in `DEFAULT_GLOBS`). Python stdlib + pyserial + esptool only.
 - **No test logic.** The plugin doesn't know about apps or vision models; it only
   makes boards do things and reports whether they did.
-- Keep ACTIONS.md in step with `_build_actions()` and `scenarios.json`.
+- Keep ACTIONS.md in step with `_build_actions()`.
 - Work in a git worktree on a feature branch and open a PR; never commit to master.
 
 ## Tests
