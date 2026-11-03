@@ -24,15 +24,14 @@ class FakeFirmware:
         self._reset_state()
 
     def _reset_state(self):
-        self.state = {"temp": "auto", "temp_c": 19.0, "sensor": "ok", "http": "normal",
-                      "http_status": 200, "setup": "accept", "sta": "on", "mqtt": "on"}
+        self.rules = {}  # (method, path) -> response text
+        self.wifi = "on"
+        self.mqtt = "on"
 
     def status(self):
-        s = {"proto": 1, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
-             "ip": "", "ssid": "", "ap_ssid": "BJF-" + self.mac.replace(":", "")[6:],
-             "ap_on": True}
-        s.update(self.state)
-        return s
+        return {"proto": 2, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
+                "ip": "", "ssid": "", "ap_ssid": "BJF-" + self.mac.replace(":", "")[6:],
+                "ap_on": True, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
 
     # -- device output --
     def emit(self, line):
@@ -69,44 +68,40 @@ class FakeFirmware:
         if payload.get("rebooting"):
             self.boot()
 
+    def add_rule(self, line):
+        """A small subset of the firmware's rule parser (docs/vt-control.md)."""
+        words = line.split()
+        if len(words) == 2 and words[0] in ("wifi", "mqtt") and words[1] in ("on", "off"):
+            setattr(self, words[0], words[1])
+            return
+        if len(words) < 4 or words[2] != "->":
+            raise ValueError("expected <METHOD> <path> -> <response>")
+        method, path = words[0], words[1]
+        if method not in ("GET", "POST", "ANY"):
+            raise ValueError("bad method")
+        resp = line.split("->", 1)[1].strip()
+        head = resp.split()[0]
+        if head != "hang" and head != "delay":
+            if not head.isdigit() or not 100 <= int(head) <= 599:
+                raise ValueError("bad status")
+        if (method, path) not in self.rules and len(self.rules) >= 16:
+            raise ValueError("too many rules")
+        self.rules[(method, path)] = resp
+
     def handle(self, cmd, args):
-        st = self.state
         if cmd == "ping":
-            return {"proto": 1}
+            return {"proto": 2}
         if cmd == "status":
             return self.status()
-        if cmd == "reset-faults":
+        if cmd == "clear":
             self._reset_state()
-        elif cmd == "temp":
-            if args == ["auto"]:
-                st.update(temp="auto", temp_c=19.0)
-            else:
-                st.update(temp="fixed", temp_c=float(args[0]))
-        elif cmd == "sensor":
-            st["sensor"] = {"ok": "ok", "fail": "fail"}[args[0]]
-        elif cmd == "http":
-            if args[0] == "normal":
-                st.update(http="normal", http_status=200)
-            elif args[0] == "error":
-                code = int(args[1])
-                if not 400 <= code <= 599:
-                    raise ValueError("code must be 400-599")
-                st.update(http="error", http_status=code)
-            elif args[0] == "hang":
-                st["http"] = "hang"
-            else:
-                raise ValueError("bad http mode")
-        elif cmd == "setup":
-            st["setup"] = args[0]
-        elif cmd == "sta":
-            st["sta"] = args[0]
-        elif cmd == "mqtt":
-            st["mqtt"] = args[0]
-        elif cmd in ("reboot", "factory-reset"):
+            return {"rules": 0}
+        if cmd == "rule":
+            self.add_rule(" ".join(args))
+            return {"rules": len(self.rules)}
+        if cmd in ("reboot", "factory-reset"):
             return {"rebooting": True}
-        else:
-            raise ValueError(f"unknown command {cmd}")
-        return self.status()
+        raise ValueError("unknown command")
 
 
 class FakeSerial:

@@ -188,23 +188,6 @@ class Board:
         with self._cond:
             return self._line_seq
 
-    def lines_since(self, seq: int) -> list:
-        with self._cond:
-            return [(s, t) for s, _, t in self._lines if s > seq]
-
-    def wait_line(self, ctx: JobContext, pattern: re.Pattern, since_seq: int):
-        """Block until a line after `since_seq` matches. Returns (seq, line, match)."""
-        while True:
-            ctx.check()
-            with self._cond:
-                for s, _, t in self._lines:
-                    if s > since_seq:
-                        m = pattern.search(t)
-                        if m:
-                            return s, t, m
-                        since_seq = s
-                self._cond.wait(min(0.25, max(ctx.remaining(), 0.01)))
-
     # ───────────── writing / VT requests ─────────────
 
     def write_line(self, line: str) -> None:

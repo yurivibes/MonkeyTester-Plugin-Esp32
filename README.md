@@ -2,9 +2,9 @@
 
 The `esp32` device plugin for
 [VisualTester](http://192.168.125.70:3000/blackjackfruit/VisualTester). It owns the
-ESP32 boards plugged into its host, flashes prebuilt firmware onto them, and puts
-them into the state an app test needs (normal readings, a broken sensor, an HTTP
-error, offline, …), then reports whether the board responded correctly.
+ESP32 boards plugged into its host, flashes prebuilt firmware onto them, and
+relays a test's expectations (how the board should answer the app: a broken
+sensor reading, an HTTP error, a hang, going offline, …) to the board.
 
 VisualTester reaches it only through the shared **Device Plugin API**
 (`PLUGIN_API.md` in the VisualTester repo). Boards are driven over their serial
@@ -56,14 +56,17 @@ and, in a test:
 
 ```
 PLUGIN: esp32 flash firmware_dir=/path/to/TemperatureSensor/result
-PLUGIN: esp32 scenario name=sensor-fail
+PLUGIN: esp32 expect
+  GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,"ok":false,"err":1,"ip":"{ip}"}
+END
 VERIFY: The temperature card shows a sensor error
+PLUGIN: esp32 clear
 ```
 
 ## What it does
 
-See [ACTIONS.md](ACTIONS.md) for every action and its params, and
-`scenarios.json` for the named board states. In short:
+See [ACTIONS.md](ACTIONS.md) for the four actions (`flash`, `reset`, `expect`,
+`clear`). In short:
 
 - **Devices** are identified by MAC (learned from the firmware's `status`), and
   can also be addressed by serial port. One job runs per board at a time.
@@ -72,14 +75,14 @@ See [ACTIONS.md](ACTIONS.md) for every action and its params, and
   `result/` of `nix build .#firmware-c3-debug-test` in TemperatureSensor. The
   directory is a path on the plugin's host; when VisualTester runs elsewhere it
   can `POST /uploads` a zip of it and pass `upload:<id>` instead.
-- **scenario** runs the scenario's VT control primitives, then reads the board's
-  status back and fails the job if the board isn't in the expected state. New
-  scenarios are added to `scenarios.json`, no code change needed, as long as the
-  firmware has the primitives.
-- **serial-expect**, **http**, **status** check what the board is actually doing.
+- **expect** is a relay: the test's inline block goes to the board line by line
+  as response rules, replacing the previous ones. The plugin doesn't know the
+  rule language; the firmware does. A new failure case is a few lines in a test,
+  with no plugin change.
+- **clear** puts the board back to normal behaviour.
 
-Job outcomes follow the contract: `passed`; `failed` when the board answered
-wrong (or not at all over VT control); `timeout`; `error` when the plugin itself
+Job outcomes follow the contract: `passed`; `failed` when the board rejected a
+rule or didn't answer over VT control; `timeout`; `error` when the plugin itself
 couldn't do it (bad firmware dir, esptool failure, port gone).
 
 ## Layout
@@ -89,5 +92,4 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 | `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads. No ESP32 code. |
 | `esp32_plugin.py` | Board discovery, actions, flashing, `main()` |
 | `board.py` | One board on one serial port: reader thread, VT control requests, reset |
-| `scenarios.json` | Named board states built from VT control primitives |
 | `tests/` | Contract and action tests with a fake board (`fake_board.py`) and a fake esptool |

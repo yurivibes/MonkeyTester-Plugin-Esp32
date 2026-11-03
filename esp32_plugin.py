@@ -15,7 +15,6 @@ Environment:
   ESP32_FLASH_BAUD   esptool baud rate        (default 460800)
   ESPTOOL            esptool command          (default: `esptool` on PATH, else
                      "<this python> -m esptool")
-  ESP32_SCENARIOS    scenarios file           (default: scenarios.json next to this file)
   ESP32_FIRMWARE_ROOT  relative firmware_dir values resolve against this
                      (default: the current directory)
   ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after a reset (default 20)
@@ -35,8 +34,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 
 import plugin_server as ps
 from board import Board
@@ -44,7 +41,6 @@ from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobCont
                            Param, Plugin, PluginServer, Uploads)
 
 VERSION = "0.1.0"
-HERE = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_GLOBS = {
     "linux": ["/dev/serial/by-id/*", "/dev/ttyUSB*", "/dev/ttyACM*"],
@@ -148,44 +144,6 @@ def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
     return proc.returncode, "\n".join(out)
 
 
-# ───────────────────────────── scenarios ─────────────────────────────
-
-
-def load_scenarios(path: str) -> dict:
-    with open(path) as f:
-        data = json.load(f)
-    for name, sc in data["scenarios"].items():
-        if not isinstance(sc.get("steps"), list) or not sc["steps"]:
-            raise ValueError(f"scenario {name!r} has no steps")
-    return data
-
-
-def _fill(template: str, values: dict) -> str:
-    def repl(m):
-        key = m.group(1)
-        if key not in values or values[key] is None:
-            raise ActionError(f"scenario needs param {key!r}", code="bad_request")
-        v = values[key]
-        if isinstance(v, float) and v.is_integer():
-            v = int(v) if key != "celsius" else v
-        return str(v)
-    return re.sub(r"\{(\w+)\}", repl, template)
-
-
-def _matches(expected, actual) -> bool:
-    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)) \
-            and not isinstance(expected, bool):
-        return abs(float(expected) - float(actual)) < 0.01
-    return expected == actual
-
-
-def _expect_value(template, values):
-    if isinstance(template, str) and re.fullmatch(r"\{\w+\}", template):
-        v = values.get(template[1:-1])
-        return v
-    return template
-
-
 # ───────────────────────────── the plugin ─────────────────────────────
 
 
@@ -194,7 +152,7 @@ class Esp32Plugin(Plugin):
     version = VERSION
     capabilities = ["events", "uploads"]
 
-    def __init__(self, ports=None, baud=None, flash_baud=None, scenarios_path=None,
+    def __init__(self, ports=None, baud=None, flash_baud=None,
                  open_serial=None, firmware_root=None, rescan=True):
         super().__init__()
         if os.environ.get("PLUGIN_UPLOAD_DIR"):
@@ -203,9 +161,6 @@ class Esp32Plugin(Plugin):
         self.baud = baud or _env_int("ESP32_BAUD", 115200)
         self.flash_baud = flash_baud or _env_int("ESP32_FLASH_BAUD", 460800)
         self.firmware_root = firmware_root or os.environ.get("ESP32_FIRMWARE_ROOT") or os.getcwd()
-        self.scenarios_path = scenarios_path or os.environ.get(
-            "ESP32_SCENARIOS", os.path.join(HERE, "scenarios.json"))
-        self.scenarios = load_scenarios(self.scenarios_path)
         self._open_serial = open_serial
         self._boards: dict[str, Board] = {}  # port -> Board
         self._lock = threading.Lock()
@@ -327,7 +282,6 @@ class Esp32Plugin(Plugin):
     # ── actions ───────────────────────────────────────────────
 
     def _build_actions(self) -> dict:
-        sc_names = sorted(self.scenarios["scenarios"])
         acts = [
             Action("flash",
                    "Write a prebuilt ESP-IDF firmware directory (containing flasher_args.json, "
@@ -342,55 +296,23 @@ class Esp32Plugin(Plugin):
                                         default=True),
                     "baud": Param("int", "esptool baud rate", default=None)},
                    default_timeout_ms=180_000),
-            Action("reset", "Hard-reset the board through EN and wait until it is ready.",
+            Action("reset", "Hard-reset the board through EN and wait until it is ready. "
+                   "Clears every expectation.",
                    self.act_reset,
                    {"wait_ready": Param("bool", "require the VT ready line", default=True)},
                    default_timeout_ms=30_000),
-            Action("wait-ready",
-                   "Wait until the firmware answers VT control (and optionally has a "
-                   "home-network IP).",
-                   self.act_wait_ready,
-                   {"require_ip": Param("bool", "also wait for an STA IP", default=False)},
+            Action("expect",
+                   "Replace the board's expectations: clear them, then load each line of "
+                   "`script` as a rule (how the board answers the app). The rule language is "
+                   "the firmware's (TemperatureSensor docs/vt-control.md); blank and # lines "
+                   "are skipped. Fails on the first line the board rejects, and leaves the "
+                   "board cleared.",
+                   self.act_expect,
+                   {"script": Param("string", "rule lines, one per line (the test's inline "
+                                    "block)", required=True)},
                    default_timeout_ms=30_000),
-            Action("status", "Read the board's status object.", self.act_status,
-                   default_timeout_ms=10_000),
-            Action("scenario",
-                   "Put the board into a named state an app test expects. Scenarios: "
-                   + "; ".join(f"{n}: {self.scenarios['scenarios'][n]['description']}"
-                               for n in sc_names),
-                   self.act_scenario,
-                   {"name": Param("enum", "scenario name", required=True, values=sc_names),
-                    "celsius": Param("float", "for fixed-temperature"),
-                    "err": Param("int", "for sensor-fail"),
-                    "status": Param("int", "for http-error (400-599)")},
-                   default_timeout_ms=30_000),
-            Action("set-temperature", "Make every reading this value (°C).",
-                   self.act_set_temperature,
-                   {"celsius": Param("float", required=True)}, default_timeout_ms=10_000),
-            Action("command", "Send one raw VT control command; passes on an `ok` reply.",
-                   self.act_command,
-                   {"line": Param("string", "e.g. `http error 503`", required=True)},
-                   default_timeout_ms=10_000),
-            Action("serial-send", "Write one raw line to the console.", self.act_serial_send,
-                   {"line": Param("string", required=True)}, default_timeout_ms=5_000),
-            Action("serial-expect",
-                   "Wait for a console line matching a regular expression.",
-                   self.act_serial_expect,
-                   {"pattern": Param("string", "Python regex", required=True),
-                    "since": Param("enum", "`job`: only lines after the job started; "
-                                   "`recent`: also the last lines already received",
-                                   default="job", values=["job", "recent"])},
-                   default_timeout_ms=30_000),
-            Action("http",
-                   "Call the board's own HTTP server (on its home-network IP, from status) "
-                   "and check the response.",
-                   self.act_http,
-                   {"path": Param("string", "e.g. /temperature.json", required=True),
-                    "method": Param("enum", values=["GET", "POST"], default="GET"),
-                    "body": Param("json", "JSON body for POST"),
-                    "expect_status": Param("int", default=200),
-                    "expect_json": Param("json", "object whose keys must match the response")},
-                   default_timeout_ms=15_000),
+            Action("clear", "Drop every expectation: the board behaves normally again.",
+                   self.act_clear, default_timeout_ms=10_000),
         ]
         return {a.name: a for a in acts}
 
@@ -464,123 +386,33 @@ class Esp32Plugin(Plugin):
             return {"status": self._wait_ready_line(ctx, b, seq)}
         return {}
 
-    def act_wait_ready(self, ctx: JobContext, p: dict):
+    def act_expect(self, ctx: JobContext, p: dict):
         b: Board = ctx.device
-        while True:
-            try:
-                status = b.command(ctx, "status", timeout=min(2.0, max(ctx.remaining(), 0.1)))
-            except ActionFailed:
-                ctx.sleep(0.5)
-                continue
-            if not p["require_ip"] or status.get("ip"):
-                return {"status": status}
-            ctx.sleep(1.0)
+        rules = [ln.strip() for ln in p["script"].splitlines()]
+        rules = [ln for ln in rules if ln and not ln.startswith("#")]
+        if not rules:
+            raise ActionError("script has no rules (use `clear` to drop expectations)",
+                              code="bad_request")
+        b.command(ctx, "clear")
+        count = 0
+        for n, rule in enumerate(rules, 1):
+            reply = b.request(ctx, "rule " + rule)
+            if not reply.ok:
+                msg = (reply.payload.get("error") if isinstance(reply.payload, dict)
+                       else reply.payload)
+                try:  # don't leave half a script loaded
+                    b.command(ctx, "clear")
+                except ActionFailed:
+                    pass
+                raise ActionFailed(f"rule {n} rejected by the board: {msg}: {rule}",
+                                   code="rule_rejected",
+                                   result={"line": n, "rule": rule, "error": msg})
+            if isinstance(reply.payload, dict):
+                count = reply.payload.get("rules", count)
+        return {"rules": count, "lines": len(rules)}
 
-    def act_status(self, ctx: JobContext, p: dict):
-        return {"status": ctx.device.command(ctx, "status")}
-
-    def act_command(self, ctx: JobContext, p: dict):
-        line = p["line"].strip()
-        if not line or "\n" in line:
-            raise ActionError("line must be one non-empty line", code="bad_request")
-        return {"reply": ctx.device.command(ctx, line)}
-
-    def act_set_temperature(self, ctx: JobContext, p: dict):
-        status = ctx.device.command(ctx, f"temp {p['celsius']}")
-        if status.get("temp") != "fixed" or not _matches(p["celsius"], status.get("temp_c")):
-            raise ActionFailed(f"board reports temp={status.get('temp')} "
-                               f"temp_c={status.get('temp_c')}", result={"status": status})
-        return {"status": status}
-
-    def act_scenario(self, ctx: JobContext, p: dict):
-        b: Board = ctx.device
-        sc = self.scenarios["scenarios"][p["name"]]
-        values = dict(self.scenarios.get("defaults") or {})
-        values.update({k: v for k, v in p.items() if v is not None and k != "name"})
-        if p["name"] == "http-error" and not 400 <= int(values["status"]) <= 599:
-            raise ActionError("status must be 400-599", code="bad_request")
-        ctx.log(f"scenario {p['name']}: {sc['description']}")
-        status = None
-        for step in sc["steps"]:
-            cmd = _fill(step, values)
-            seq = b.line_seq
-            reply = b.command(ctx, cmd)
-            if isinstance(reply, dict) and reply.get("rebooting"):
-                status = self._wait_ready_line(ctx, b, seq)
-            elif isinstance(reply, dict) and "proto" in reply:
-                status = reply
-        if status is None:
-            status = b.command(ctx, "status")
-        mismatches = {}
-        for key, tmpl in (sc.get("expect") or {}).items():
-            want = _expect_value(tmpl, values)
-            if not _matches(want, status.get(key)):
-                mismatches[key] = {"expected": want, "actual": status.get(key)}
-        if mismatches:
-            raise ActionFailed(f"board is not in scenario {p['name']!r}: {mismatches}",
-                               result={"status": status, "mismatches": mismatches})
-        return {"scenario": p["name"], "status": status}
-
-    def act_serial_send(self, ctx: JobContext, p: dict):
-        ctx.log(f"-> {p['line']}")
-        ctx.device.write_line(p["line"])
-        return {}
-
-    def act_serial_expect(self, ctx: JobContext, p: dict):
-        b: Board = ctx.device
-        try:
-            pattern = re.compile(p["pattern"])
-        except re.error as e:
-            raise ActionError(f"bad pattern: {e}", code="bad_request") from None
-        since = b.line_seq if p["since"] == "job" else 0
-        ctx.log(f"waiting for /{p['pattern']}/")
-        _, line, m = b.wait_line(ctx, pattern, since)
-        ctx.log(f"matched: {line}")
-        return {"line": line, "groups": list(m.groups()), "named": m.groupdict()}
-
-    def act_http(self, ctx: JobContext, p: dict):
-        b: Board = ctx.device
-        status = b.command(ctx, "status")
-        ip = status.get("ip")
-        if not ip:
-            raise ActionFailed("the board has no home-network IP", code="no_ip",
-                               result={"status": status})
-        url = f"http://{ip}{p['path'] if p['path'].startswith('/') else '/' + p['path']}"
-        data = None
-        headers = {}
-        if p["method"] == "POST":
-            data = json.dumps(p["body"] if p["body"] is not None else {}).encode()
-            headers["Content-Type"] = "application/json"
-        ctx.log(f"{p['method']} {url}")
-        req = urllib.request.Request(url, data=data, method=p["method"], headers=headers)
-        timeout = max(0.5, ctx.remaining())
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                code, body = r.status, r.read()
-        except urllib.error.HTTPError as e:
-            code, body = e.code, e.read()
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            ctx.check()  # a deadline hit shows as `timeout`, not a failure
-            raise ActionFailed(f"request failed: {e}", code="http_unreachable") from None
-        text = body.decode("utf-8", "replace")
-        ctx.log(f"<- {code} {text[:300]}")
-        result = {"url": url, "status": code, "body": text}
-        try:
-            result["json"] = json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        if code != p["expect_status"]:
-            raise ActionFailed(f"expected HTTP {p['expect_status']}, got {code}",
-                               code="unexpected_status", result=result)
-        if p["expect_json"] is not None:
-            got = result.get("json")
-            if not isinstance(got, dict) or not isinstance(p["expect_json"], dict):
-                raise ActionFailed("response is not a JSON object", result=result)
-            bad = {k: {"expected": v, "actual": got.get(k)}
-                   for k, v in p["expect_json"].items() if not _matches(v, got.get(k))}
-            if bad:
-                raise ActionFailed(f"response mismatch: {bad}", result=result)
-        return result
+    def act_clear(self, ctx: JobContext, p: dict):
+        return ctx.device.command(ctx, "clear")
 
 
 def main() -> None:

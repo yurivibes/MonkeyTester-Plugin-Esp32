@@ -131,49 +131,53 @@ class ContractTests(unittest.TestCase):
     def test_actions_have_schemas(self):
         code, a = self.h.call("GET", "/actions")
         names = {x["name"]: x for x in a["actions"]}
-        for n in ("flash", "reset", "wait-ready", "status", "scenario", "serial-expect", "http"):
-            self.assertIn(n, names)
+        self.assertEqual(sorted(names), ["clear", "expect", "flash", "reset"])
         self.assertEqual(names["flash"]["params"]["firmware_dir"]["type"], "path")
-        self.assertIn("sensor-fail", names["scenario"]["params"]["name"]["values"])
+        self.assertEqual(names["expect"]["params"]["script"],
+                         {"type": "string", "required": True,
+                          "description": names["expect"]["params"]["script"]["description"]})
 
     def test_unknown_action_and_device_and_params(self):
         code, r = self.h.call("POST", "/jobs", {"action": "nope"})
         self.assertEqual((code, r["code"]), (404, "unknown_action"))
-        code, r = self.h.call("POST", "/jobs", {"action": "status", "device": "zz"})
+        code, r = self.h.call("POST", "/jobs", {"action": "clear", "device": "zz"})
         self.assertEqual((code, r["code"]), (404, "unknown_device"))
-        code, r = self.h.call("POST", "/jobs", {"action": "status", "params": {"x": 1}})
+        code, r = self.h.call("POST", "/jobs", {"action": "clear", "params": {"x": 1}})
         self.assertEqual((code, r["code"]), (400, "bad_request"))
-        code, r = self.h.call("POST", "/jobs", {"action": "scenario", "params": {"name": "nah"}})
+        code, r = self.h.call("POST", "/jobs", {"action": "flash", "params": {"erase": "maybe"}})
         self.assertEqual((code, r["code"]), (400, "bad_request"))
         code, r = self.h.call("GET", "/jobs/j-missing")
         self.assertEqual((code, r["code"]), (404, "not_found"))
 
     def test_device_alias_by_port(self):
-        job = self.h.run("status", device="/dev/fake0")
+        job = self.h.run("clear", device="/dev/fake0")
         self.assertEqual(job["state"], "passed")
         self.assertEqual(job["device"], "7c:df:a1:a4:8f:00")
 
+    def _never_ready(self):
+        # A reset whose board never prints the ready line keeps the job running.
+        self.h.fws["/dev/fake0"].ready_on_boot = False
+
     def test_busy_device_is_409(self):
-        code, r = self.h.call("POST", "/jobs", {"action": "serial-expect",
-                                                "params": {"pattern": "never"},
-                                                "timeout_ms": 2000})
+        self._never_ready()
+        code, r = self.h.call("POST", "/jobs", {"action": "reset", "timeout_ms": 2000})
         self.assertEqual(code, 202)
-        code, r2 = self.h.call("POST", "/jobs", {"action": "status"})
+        code, r2 = self.h.call("POST", "/jobs", {"action": "clear"})
         self.assertEqual((code, r2["code"]), (409, "device_busy"))
         code, d = self.h.call("GET", "/devices")
         self.assertEqual(d["devices"][0]["state"], "busy")
 
     def test_timeout_state(self):
-        job = self.h.run("serial-expect", {"pattern": "never-printed"}, timeout_ms=500)
+        self._never_ready()
+        job = self.h.run("reset", timeout_ms=500)
         self.assertEqual(job["state"], "timeout")
         self.assertEqual(job["error"]["code"], "timeout")
         # the device is free again
-        self.assertEqual(self.h.run("status")["state"], "passed")
+        self.assertEqual(self.h.run("clear")["state"], "passed")
 
     def test_cancel(self):
-        code, r = self.h.call("POST", "/jobs", {"action": "serial-expect",
-                                                "params": {"pattern": "never"},
-                                                "timeout_ms": 20000})
+        self._never_ready()
+        code, r = self.h.call("POST", "/jobs", {"action": "reset", "timeout_ms": 20000})
         jid = r["job"]["id"]
         time.sleep(0.2)
         code, c = self.h.call("POST", f"/jobs/{jid}/cancel")
@@ -181,9 +185,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(c["job"]["state"], "cancelled")
 
     def test_wait_returns_running_job_when_wait_expires(self):
-        code, r = self.h.call("POST", "/jobs", {"action": "serial-expect",
-                                                "params": {"pattern": "never"},
-                                                "timeout_ms": 5000})
+        self._never_ready()
+        code, r = self.h.call("POST", "/jobs", {"action": "reset", "timeout_ms": 5000})
         t = time.time()
         code, job = self.h.call("GET", f"/jobs/{r['job']['id']}?wait=0.3")
         self.assertEqual(job["state"], "running")
@@ -236,69 +239,64 @@ class ActionTests(unittest.TestCase):
     def tearDown(self):
         self.h.close()
 
-    def test_status(self):
-        job = self.h.run("status")
-        self.assertEqual(job["state"], "passed")
-        self.assertEqual(job["result"]["status"]["mac"], "7c:df:a1:a4:8f:00")
-        self.assertTrue(any(l.startswith("-> @vt ") for l in job["log"]))
+    SCRIPT = """
+        # the app sees a broken sensor
+        GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,"ok":false,"err":1}
 
-    def test_every_scenario_passes(self):
-        for name in sorted(self.h.plugin.scenarios["scenarios"]):
-            with self.subTest(name):
-                job = self.h.run("scenario", {"name": name})
-                self.assertEqual(job["state"], "passed", job)
+        POST /setup -> 500
+        wifi off
+    """
 
-    def test_scenario_params(self):
-        job = self.h.run("scenario", {"name": "fixed-temperature", "celsius": "23.25"})
+    def test_expect_loads_rules_in_order(self):
+        job = self.h.run("expect", {"script": self.SCRIPT})
         self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(self.fw.state["temp_c"], 23.25)
-        job = self.h.run("scenario", {"name": "http-error", "status": 503})
+        self.assertEqual(job["result"], {"rules": 2, "lines": 3})
+        sent = [l.split(" ", 2)[2] for l in self.fw.received if l.startswith("@vt p")]
+        self.assertEqual(sent[-4:], [
+            "clear",
+            'rule GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,'
+            '"ok":false,"err":1}',
+            "rule POST /setup -> 500",
+            "rule wifi off"])
+        self.assertEqual(self.fw.wifi, "off")
+
+    def test_expect_replaces_previous_expectations(self):
+        self.h.run("expect", {"script": "GET /a -> 500\nGET /b -> 500"})
+        job = self.h.run("expect", {"script": "GET /c -> hang"})
         self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(self.fw.state["http_status"], 503)
-        self.assertIn("@vt", self.fw.received[-1])
-        self.assertTrue(self.fw.received[-1].endswith("http error 503"))
-        # back to happy clears everything
-        self.assertEqual(self.h.run("scenario", {"name": "happy"})["state"], "passed")
-        self.assertEqual(self.fw.state["http"], "normal")
+        self.assertEqual(list(self.fw.rules), [("GET", "/c")])
 
-    def test_scenario_fails_when_device_disagrees(self):
-        orig = self.fw.handle
-
-        def lying(cmd, args):
-            r = orig(cmd, args)
-            if cmd == "sensor":
-                self.fw.state["sensor"] = "ok"
-                r = self.fw.status()
-            return r
-        self.fw.handle = lying
-        job = self.h.run("scenario", {"name": "sensor-fail"})
+    def test_rejected_rule_fails_and_clears(self):
+        job = self.h.run("expect", {"script": "GET /a -> 500\nGET /b => 500\nGET /c -> 500"})
         self.assertEqual(job["state"], "failed")
-        self.assertIn("sensor", job["result"]["mismatches"])
+        self.assertEqual(job["error"]["code"], "rule_rejected")
+        self.assertEqual(job["result"]["line"], 2)
+        self.assertIn("GET /b => 500", job["error"]["message"])
+        self.assertEqual(self.fw.rules, {})
+        self.assertNotIn("rule GET /c -> 500", " ".join(self.fw.received))
 
-    def test_device_err_reply_is_failed(self):
-        job = self.h.run("command", {"line": "bogus"})
-        self.assertEqual(job["state"], "failed")
-        self.assertEqual(job["error"]["code"], "device_error")
-        self.assertEqual(self.h.run("command", {"line": "sta off"})["state"], "passed")
-        self.assertEqual(self.fw.state["sta"], "off")
+    def test_empty_script_is_error(self):
+        job = self.h.run("expect", {"script": "  \n# nothing\n"})
+        self.assertEqual(job["state"], "error")
+        self.assertEqual(job["error"]["code"], "bad_request")
 
-    def test_unprovisioned_reboots_and_waits_ready(self):
-        before = self.fw.reboots
-        job = self.h.run("scenario", {"name": "unprovisioned"})
+    def test_script_is_required(self):
+        code, r = self.h.call("POST", "/jobs", {"action": "expect"})
+        self.assertEqual((code, r["code"]), (400, "bad_request"))
+
+    def test_clear(self):
+        self.h.run("expect", {"script": "GET /a -> 500\nmqtt off"})
+        job = self.h.run("clear")
         self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(self.fw.reboots, before + 1)
-
-    def test_set_temperature(self):
-        job = self.h.run("set-temperature", {"celsius": -4.5})
-        self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(self.fw.state["temp_c"], -4.5)
+        self.assertEqual(job["result"], {"rules": 0})
+        self.assertEqual((self.fw.rules, self.fw.mqtt), ({}, "on"))
 
     def test_reset_waits_for_ready(self):
         before = self.fw.reboots
         job = self.h.run("reset")
         self.assertEqual(job["state"], "passed", job)
         self.assertEqual(self.fw.reboots, before + 1)
-        self.assertEqual(job["result"]["status"]["proto"], 1)
+        self.assertEqual(job["result"]["status"]["proto"], 2)
 
     def test_reset_fails_without_ready_line(self):
         self.fw.ready_on_boot = False
@@ -308,33 +306,9 @@ class ActionTests(unittest.TestCase):
 
     def test_hung_firmware_is_failed_no_reply(self):
         self.fw.silent = True
-        job = self.h.run("status")
+        job = self.h.run("clear")
         self.assertEqual(job["state"], "failed")
         self.assertEqual(job["error"]["code"], "no_reply")
-
-    def test_serial_expect(self):
-        def later():
-            time.sleep(0.3)
-            self.fw.emit("I (999) wifi: sta ip: 192.168.125.80")
-        threading.Thread(target=later).start()
-        job = self.h.run("serial-expect", {"pattern": r"sta ip: (\S+)"}, timeout_ms=5000)
-        self.assertEqual(job["state"], "passed", job)
-        self.assertEqual(job["result"]["groups"], ["192.168.125.80"])
-
-    def test_serial_expect_recent(self):
-        job = self.h.run("serial-expect", {"pattern": "test mode enabled", "since": "recent"},
-                         timeout_ms=3000)
-        # the boot banner was only printed if the fake booted; send it now otherwise
-        if job["state"] != "passed":
-            self.fw.emit("I (1) temp-sensor: test mode enabled")
-            job = self.h.run("serial-expect", {"pattern": "test mode enabled",
-                                               "since": "recent"}, timeout_ms=3000)
-        self.assertEqual(job["state"], "passed", job)
-
-    def test_http_needs_ip(self):
-        job = self.h.run("http", {"path": "/temperature.json"})
-        self.assertEqual(job["state"], "failed")
-        self.assertEqual(job["error"]["code"], "no_ip")
 
 
 class FlashTests(unittest.TestCase):
@@ -392,7 +366,7 @@ class FlashTests(unittest.TestCase):
         self.assertEqual(job["state"], "error")
         self.assertEqual(job["error"]["code"], "flash_failed")
         # port came back
-        self.assertEqual(self.h.run("status")["state"], "passed")
+        self.assertEqual(self.h.run("clear")["state"], "passed")
 
     def test_flash_non_vt_firmware_fails_ready_check(self):
         self.h.fws["/dev/fake0"].vt = False
@@ -406,11 +380,12 @@ class MultiBoardTests(unittest.TestCase):
     def test_device_required_with_two_boards(self):
         h = Harness(ports=("/dev/fake0", "/dev/fake1"))
         try:
-            code, r = h.call("POST", "/jobs", {"action": "status"})
+            code, r = h.call("POST", "/jobs", {"action": "clear"})
             self.assertEqual((code, r["code"]), (400, "bad_request"))
-            job = h.run("status", device="7c:df:a1:a4:8f:01")
+            job = h.run("expect", {"script": "GET /x -> 500"}, device="7c:df:a1:a4:8f:01")
             self.assertEqual(job["state"], "passed")
-            self.assertEqual(job["result"]["status"]["mac"], "7c:df:a1:a4:8f:01")
+            self.assertEqual(h.fws["/dev/fake1"].rules, {("GET", "/x"): "500"})
+            self.assertEqual(h.fws["/dev/fake0"].rules, {})
         finally:
             h.close()
 
