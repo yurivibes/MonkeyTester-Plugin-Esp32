@@ -1,0 +1,55 @@
+{
+  "_comment": "Named device states an app test can ask for. Each scenario is a list of VT control primitives (TemperatureSensor docs/vt-control.md) run in order, then `expect` is checked against the board's status object. {param} placeholders come from the scenario action's params.",
+  "scenarios": {
+    "happy": {
+      "description": "Normal operation: readings flow (dummy 19.0/20.1 C in test builds), HTTP, setup, Wi-Fi and MQTT all work.",
+      "steps": ["reset-faults"],
+      "expect": {"sensor": "ok", "temp": "auto", "http": "normal", "setup": "accept", "sta": "on", "mqtt": "on"}
+    },
+    "fixed-temperature": {
+      "description": "Readings are always {celsius} C.",
+      "params": ["celsius"],
+      "steps": ["reset-faults", "temp {celsius}"],
+      "expect": {"sensor": "ok", "temp": "fixed", "temp_c": "{celsius}"}
+    },
+    "sensor-fail": {
+      "description": "The sensor is broken: readings are ok:false with err={err}.",
+      "params": ["err"],
+      "steps": ["reset-faults", "sensor fail {err}"],
+      "expect": {"sensor": "fail"}
+    },
+    "http-error": {
+      "description": "The board's HTTP endpoints answer status {status}.",
+      "params": ["status"],
+      "steps": ["reset-faults", "http error {status}"],
+      "expect": {"http": "error", "http_status": "{status}"}
+    },
+    "http-hang": {
+      "description": "The board accepts HTTP connections but never answers (app request timeouts).",
+      "steps": ["reset-faults", "http hang"],
+      "expect": {"http": "hang"}
+    },
+    "setup-reject": {
+      "description": "POST /setup (provisioning) fails with 500 and stores nothing.",
+      "steps": ["reset-faults", "setup reject"],
+      "expect": {"setup": "reject"}
+    },
+    "offline": {
+      "description": "The board leaves the home network and stays off it (soft-AP unchanged).",
+      "steps": ["reset-faults", "sta off"],
+      "expect": {"sta": "off"}
+    },
+    "mqtt-silent": {
+      "description": "The board stops publishing readings over MQTT; HTTP still works.",
+      "steps": ["reset-faults", "mqtt off"],
+      "expect": {"mqtt": "off"}
+    },
+    "unprovisioned": {
+      "description": "Forget the app-provisioned Wi-Fi credentials and reboot, like a fresh board.",
+      "steps": ["factory-reset"],
+      "reboots": true,
+      "expect": {}
+    }
+  },
+  "defaults": {"celsius": 21.5, "err": 1, "status": 500}
+}
