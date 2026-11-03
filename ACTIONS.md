@@ -8,8 +8,26 @@ parameter schemas. `device` may be omitted when one board is attached.
 |---|---|---|---|
 | `flash` | `firmware_dir` (path, required), `erase` (bool, false), `wait_ready` (bool, true), `baud` (int) | esptool succeeds and, with `wait_ready`, the board prints `@vt - ready` (or answers `status`) after reboot | 180 s |
 | `reset` | `wait_ready` (bool, true) | EN is pulsed and the board prints `@vt - ready`. A reboot drops every rule | 30 s |
+| `factory-reset` | — | The board forgets its provisioned Wi-Fi network, reboots, and comes back ready with no rules | 30 s |
+| `broadcast-ssid` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board reports its provisioning SSID (`BJF-<mac>`) is broadcasting; `result.ssid` is the name | 10 s |
 | `expect` | `script` (string, required; the test's inline block) | The board accepted every rule line | 30 s |
 | `clear` | — | The board dropped every rule and directive | 10 s |
+
+## Starting a test
+
+Start every app test from factory settings, then let the app find the board:
+
+```
+PLUGIN: esp32 factory-reset
+PLUGIN: esp32 broadcast-ssid seconds=0
+# the app now joins BJF-<mac> and provisions the board
+```
+
+`factory-reset` erases the provisioned network (the board falls back to the
+build's placeholder default, so it isn't on any real network) and drops every
+rule. `broadcast-ssid` turns on the provisioning network as if the board's
+button had been held. In `debug` builds that network is always on and the action
+only confirms it; in `release` builds it's what makes the board visible.
 
 ## `expect`
 

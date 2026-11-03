@@ -56,6 +56,9 @@ and, in a test:
 
 ```
 PLUGIN: esp32 flash firmware_dir=/path/to/TemperatureSensor/result
+PLUGIN: esp32 factory-reset
+PLUGIN: esp32 broadcast-ssid seconds=0
+# … the app provisions the board over BJF-<mac> …
 PLUGIN: esp32 expect
   GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,"ok":false,"err":1,"ip":"{ip}"}
 END
@@ -65,8 +68,8 @@ PLUGIN: esp32 clear
 
 ## What it does
 
-See [ACTIONS.md](ACTIONS.md) for the four actions (`flash`, `reset`, `expect`,
-`clear`). In short:
+See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
+`factory-reset`, `broadcast-ssid`, `expect`, `clear`). In short:
 
 - **Devices** are identified by MAC (learned from the firmware's `status`), and
   can also be addressed by serial port. One job runs per board at a time.
@@ -81,6 +84,9 @@ See [ACTIONS.md](ACTIONS.md) for the four actions (`flash`, `reset`, `expect`,
   doesn't know the rule language; the firmware does. A new failure case is a few
   lines in a test, with no plugin change.
 - **clear** puts the board back to normal behaviour.
+- **factory-reset** (a test's first device step) forgets the provisioned
+  network and reboots; **broadcast-ssid** starts the provisioning SSID so the
+  app can find and provision the board.
 
 Job outcomes follow the contract: `passed`; `failed` when the board rejected a
 rule or didn't answer over VT control; `timeout`; `error` when the plugin itself

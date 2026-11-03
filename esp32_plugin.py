@@ -309,6 +309,18 @@ class Esp32Plugin(Plugin):
                    self.act_reset,
                    {"wait_ready": Param("bool", "require the VT ready line", default=True)},
                    default_timeout_ms=30_000),
+            Action("factory-reset",
+                   "Put the board back to factory settings: forget the provisioned Wi-Fi "
+                   "network, drop every rule, reboot, and wait until it is ready. Use it as a "
+                   "test's first device step.",
+                   self.act_factory_reset, default_timeout_ms=30_000),
+            Action("broadcast-ssid",
+                   "Start broadcasting the provisioning SSID (BJF-<mac>) so the app can find "
+                   "and provision the board, as if its provisioning button had been held.",
+                   self.act_broadcast_ssid,
+                   {"seconds": Param("int", "how long to broadcast; 0 = until provisioned or "
+                                     "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
+                   default_timeout_ms=10_000),
             Action("expect",
                    "Apply changes to how the board answers the app: each line of `script` is "
                    "sent as a rule, on top of the rules already loaded (state only what "
@@ -394,6 +406,31 @@ class Esp32Plugin(Plugin):
         if p["wait_ready"]:
             return {"status": self._wait_ready_line(ctx, b, seq)}
         return {}
+
+    def act_factory_reset(self, ctx: JobContext, p: dict):
+        b: Board = ctx.device
+        seq = b.line_seq
+        reply = b.command(ctx, "factory-reset")
+        if not (isinstance(reply, dict) and reply.get("rebooting")):
+            raise ActionFailed(f"unexpected reply to factory-reset: {reply}",
+                               result={"reply": reply})
+        status = self._wait_ready_line(ctx, b, seq)
+        if status.get("rules"):
+            raise ActionFailed(f"board still has {status['rules']} rule(s) after reboot",
+                               result={"status": status})
+        ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
+                f"provisioning ssid {status.get('ap_ssid')!r}")
+        return {"status": status}
+
+    def act_broadcast_ssid(self, ctx: JobContext, p: dict):
+        b: Board = ctx.device
+        cmd = "ap-start" if p["seconds"] is None else f"ap-start {p['seconds']}"
+        status = b.command(ctx, cmd)
+        if not status.get("ap_on"):
+            raise ActionFailed("the board reports its provisioning AP is off",
+                               result={"status": status})
+        ctx.log(f"broadcasting {status.get('ap_ssid')!r}")
+        return {"ssid": status.get("ap_ssid"), "status": status}
 
     def act_expect(self, ctx: JobContext, p: dict):
         """Apply a block of changes. Nothing is cleared first: rules accumulate on
