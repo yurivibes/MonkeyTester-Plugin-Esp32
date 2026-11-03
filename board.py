@@ -180,6 +180,8 @@ class Board:
             self.status = payload
             if payload.get("mac") and payload["mac"] != self.mac:
                 self.mac = payload["mac"]
+            if self.mac and self.id == self.port:
+                self.id = self.mac  # first time we learn who this board is
 
     # ───────────── line access for actions ─────────────
 

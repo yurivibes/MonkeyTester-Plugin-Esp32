@@ -206,8 +206,16 @@ class Esp32Plugin(Plugin):
                 self.events.publish(b.id, "state", {"state": "removed", "port": port})
         for port in ports:
             with self._lock:
-                if port in self._boards:
-                    continue
+                known_board = self._boards.get(port)
+            if known_board is not None:
+                # Not identified yet (booting, or flashed with non-VT firmware since)?
+                # Ask again, unless a job owns the board.
+                if (known_board.mac is None and known_board.online
+                        and not known_board._paused.is_set()
+                        and not (self.jobs and self.jobs.is_busy(known_board.id))):
+                    threading.Thread(target=self._identify, args=(known_board,),
+                                     daemon=True).start()
+                continue
             b = Board(port, self.baud, self.events, open_serial=self._open_serial)
             try:
                 b.start()
