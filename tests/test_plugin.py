@@ -131,7 +131,8 @@ class ContractTests(unittest.TestCase):
     def test_actions_have_schemas(self):
         code, a = self.h.call("GET", "/actions")
         names = {x["name"]: x for x in a["actions"]}
-        self.assertEqual(sorted(names), ["clear", "expect", "flash", "reset"])
+        self.assertEqual(sorted(names), ["broadcast-ssid", "clear", "expect", "factory-reset",
+                                         "flash", "reset"])
         self.assertEqual(names["flash"]["params"]["firmware_dir"]["type"], "path")
         self.assertEqual(names["expect"]["params"]["script"],
                          {"type": "string", "required": True,
@@ -282,6 +283,35 @@ class ActionTests(unittest.TestCase):
         self.assertIn("GET /b => 500", job["error"]["message"])
         self.assertEqual(set(self.fw.rules), {("GET", "/old"), ("GET", "/a")})
         self.assertNotIn("rule GET /c -> 500", " ".join(self.fw.received))
+
+    def test_factory_reset(self):
+        self.h.run("expect", {"script": "GET /a -> 500"})
+        before = self.fw.reboots
+        job = self.h.run("factory-reset")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.fw.reboots, before + 1)
+        self.assertEqual(self.fw.provisioned_ssid, "")
+        self.assertEqual(job["result"]["status"]["rules"], 0)
+        self.assertEqual(job["result"]["status"]["ssid"], "MyAccessPoint")
+
+    def test_factory_reset_needs_reboot(self):
+        self.fw.ready_on_boot = False
+        job = self.h.run("factory-reset", timeout_ms=60000)
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "not_ready")
+
+    def test_broadcast_ssid(self):
+        job = self.h.run("broadcast-ssid")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(job["result"]["ssid"], "BJF-a48f00")
+        self.assertIsNone(self.fw.ap_seconds)
+        self.assertTrue(self.fw.received[-1].endswith(" ap-start"))
+        job = self.h.run("broadcast-ssid", {"seconds": "0"})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.fw.ap_seconds, 0)
+        job = self.h.run("broadcast-ssid", {"seconds": 99999})
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "device_error")
 
     def test_empty_script_is_error(self):
         job = self.h.run("expect", {"script": "  \n# nothing\n"})

@@ -23,6 +23,10 @@ class FakeFirmware:
         self.silent = False  # True: ignore all requests (hung firmware)
         self._reset_state()
 
+    provisioned_ssid = "External"
+    ap_on = False
+    ap_seconds = None
+
     def _reset_state(self):
         self.rules = {}  # (method, path) -> response text
         self.wifi = "on"
@@ -30,8 +34,8 @@ class FakeFirmware:
 
     def status(self):
         return {"proto": 2, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
-                "ip": "", "ssid": "", "ap_ssid": "BJF-" + self.mac.replace(":", "")[6:],
-                "ap_on": True, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
+                "ip": "", "ssid": self.provisioned_ssid or "MyAccessPoint",
+                "ap_ssid": "BJF-" + self.mac.replace(":", "")[6:], "ap_on": self.ap_on, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
 
     # -- device output --
     def emit(self, line):
@@ -103,7 +107,15 @@ class FakeFirmware:
             self.add_rule(" ".join(args))
             return {"rules": len(self.rules)}
         if cmd in ("reboot", "factory-reset"):
+            if cmd == "factory-reset":
+                self.provisioned_ssid = ""
             return {"rebooting": True}
+        if cmd == "ap-start":
+            if args and (not args[0].isdigit() or int(args[0]) > 86400):
+                raise ValueError("bad seconds (0-86400)")
+            self.ap_on = True
+            self.ap_seconds = int(args[0]) if args else None
+            return self.status()
         raise ValueError("unknown command")
 
 
