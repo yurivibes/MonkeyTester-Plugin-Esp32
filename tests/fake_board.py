@@ -85,7 +85,18 @@ class FakeFirmware:
             raise ValueError("bad method")
         resp = line.split("->", 1)[1].strip()
         head = resp.split()[0]
-        if head not in ("hang", "delay", "normal"):
+        if head == "sequence":
+            values = resp.split()[1:]
+            if not 1 <= len(values) <= 8:
+                raise ValueError("bad sequence")
+            for v in values:
+                try:
+                    t = float(v)
+                except ValueError:
+                    raise ValueError("bad sequence value")
+                if not -55 <= t <= 125:
+                    raise ValueError("bad sequence value")
+        elif head not in ("hang", "delay", "normal"):
             if not head.isdigit() or not 100 <= int(head) <= 599:
                 raise ValueError("bad status")
         if head == "normal":
