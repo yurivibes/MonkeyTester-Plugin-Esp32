@@ -131,8 +131,8 @@ class ContractTests(unittest.TestCase):
     def test_actions_have_schemas(self):
         code, a = self.h.call("GET", "/actions")
         names = {x["name"]: x for x in a["actions"]}
-        self.assertEqual(sorted(names), ["broadcast-ssid", "clear", "expect", "factory-reset",
-                                         "flash", "reset"])
+        self.assertEqual(sorted(names), ["ble-advertise", "broadcast-ssid", "clear", "expect",
+                                         "factory-reset", "flash", "reset"])
         self.assertEqual(names["flash"]["params"]["firmware_dir"]["type"], "path")
         self.assertEqual(names["expect"]["params"]["script"],
                          {"type": "string", "required": True,
@@ -321,6 +321,38 @@ class ActionTests(unittest.TestCase):
         job = self.h.run("broadcast-ssid", {"seconds": 99999})
         self.assertEqual(job["state"], "failed")
         self.assertEqual(job["error"]["code"], "device_error")
+
+    def test_ble_advertise(self):
+        self.fw.transport = "ble"
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual((job["result"]["name"], job["result"]["transport"]), ("BJF-a48f00", "ble"))
+        self.assertTrue(job["result"]["status"]["prov_on"])
+        self.assertFalse(job["result"]["status"]["ap_on"])
+        self.assertIsNone(self.fw.ap_seconds)
+        self.assertTrue(self.fw.received[-1].endswith(" prov-start"))
+        job = self.h.run("ble-advertise", {"seconds": "0"})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertTrue(self.fw.received[-1].endswith(" prov-start 0"))
+        self.assertEqual(self.fw.ap_seconds, 0)
+        job = self.h.run("ble-advertise", {"seconds": 99999})
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "device_error")
+
+    def test_ble_advertise_on_softap_build_fails(self):
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "wrong_transport")
+        self.assertIn("use broadcast-ssid", job["error"]["message"])
+
+    def test_ble_advertise_on_old_firmware_fails(self):
+        self.fw.transport = None
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "unsupported")
+        self.assertIn("firmware too old for prov-start", job["error"]["message"])
+        # broadcast-ssid still works on that firmware
+        self.assertEqual(self.h.run("broadcast-ssid")["state"], "passed")
 
     def test_empty_script_is_error(self):
         job = self.h.run("expect", {"script": "  \n# nothing\n"})
