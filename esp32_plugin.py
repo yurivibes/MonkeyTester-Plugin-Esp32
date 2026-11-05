@@ -321,6 +321,14 @@ class Esp32Plugin(Plugin):
                    {"seconds": Param("int", "how long to broadcast; 0 = until provisioned or "
                                      "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
                    default_timeout_ms=10_000),
+            Action("ble-advertise",
+                   "Start BLE provisioning: the board advertises as BJF-<mac> so the app can "
+                   "find and provision it, as if its provisioning button had been held. Needs "
+                   "firmware with `prov-start`; soft-AP builds use broadcast-ssid.",
+                   self.act_ble_advertise,
+                   {"seconds": Param("int", "how long to advertise; 0 = until provisioned or "
+                                     "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
+                   default_timeout_ms=10_000),
             Action("expect",
                    "Apply changes to how the board answers the app: each line of `script` is "
                    "sent as a rule, on top of the rules already loaded (state only what "
@@ -431,6 +439,28 @@ class Esp32Plugin(Plugin):
                                result={"status": status})
         ctx.log(f"broadcasting {status.get('ap_ssid')!r}")
         return {"ssid": status.get("ap_ssid"), "status": status}
+
+    def act_ble_advertise(self, ctx: JobContext, p: dict):
+        b: Board = ctx.device
+        cmd = "prov-start" if p["seconds"] is None else f"prov-start {p['seconds']}"
+        reply = b.request(ctx, cmd)
+        if not reply.ok:
+            msg = reply.payload.get("error") if isinstance(reply.payload, dict) else reply.payload
+            if msg == "unknown command":
+                raise ActionFailed("firmware too old for prov-start (flash a build with BLE "
+                                   "provisioning)", code="unsupported", result=reply.payload)
+            raise ActionFailed(f"device rejected {cmd!r}: {msg}", code="device_error",
+                               result=reply.payload)
+        status = reply.payload
+        if status.get("transport") == "softap":
+            raise ActionFailed("board runs a soft-AP build; use broadcast-ssid",
+                               code="wrong_transport", result={"status": status})
+        if not status.get("prov_on"):
+            raise ActionFailed("the board reports provisioning is off",
+                               result={"status": status})
+        ctx.log(f"advertising {status.get('ble_name')!r} over {status.get('transport')}")
+        return {"name": status.get("ble_name"), "transport": status.get("transport"),
+                "status": status}
 
     def act_expect(self, ctx: JobContext, p: dict):
         """Apply a block of changes. Nothing is cleared first: rules accumulate on

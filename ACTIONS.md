@@ -10,6 +10,7 @@ parameter schemas. `device` may be omitted when one board is attached.
 | `reset` | `wait_ready` (bool, true) | EN is pulsed and the board prints `@vt - ready`. A reboot drops every rule | 30 s |
 | `factory-reset` | — | The board forgets its provisioned Wi-Fi network, reboots, and comes back ready with no rules | 30 s |
 | `broadcast-ssid` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board reports its provisioning SSID (`BJF-<mac>`) is broadcasting; `result.ssid` is the name | 10 s |
+| `ble-advertise` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board answers `prov-start` and reports BLE provisioning is on; `result.name` is its BLE name (`BJF-<mac>`), `result.transport` is `ble`. Needs firmware with `prov-start` | 10 s |
 | `expect` | `script` (string, required; the test's inline block) | The board accepted every rule line | 30 s |
 | `clear` | — | The board dropped every rule and directive | 10 s |
 
@@ -19,15 +20,21 @@ Start every app test from factory settings, then let the app find the board:
 
 ```
 PLUGIN: esp32 factory-reset
-PLUGIN: esp32 broadcast-ssid seconds=0
-# the app now joins BJF-<mac> and provisions the board
+PLUGIN: esp32 ble-advertise seconds=0
+# the app now finds BLE device BJF-<mac> and provisions the board
 ```
 
 `factory-reset` erases the provisioned network (the board falls back to the
 build's placeholder default, so it isn't on any real network) and drops every
-rule. `broadcast-ssid` turns on the provisioning network as if the board's
-button had been held. In `debug` builds that network is always on and the action
-only confirms it; in `release` builds it's what makes the board visible.
+rule. `ble-advertise` sends the firmware's `prov-start`, which turns provisioning
+on as if the board's button had been held. In `debug` builds provisioning is
+always on and the action only confirms it; in `release` builds it's what makes
+the board visible.
+
+Boards running a soft-AP provisioning build (the app joins the open Wi-Fi
+network `BJF-<mac>` and POSTs `/setup`) use `broadcast-ssid` instead, which
+sends `ap-start`. `ble-advertise` fails with `wrong_transport` on such a board,
+and with `unsupported` on firmware older than `prov-start`.
 
 ## `expect`
 
@@ -68,7 +75,9 @@ sent.
 |---|---|---|
 | `rule_rejected` | failed | The firmware rejected a rule line (`result.line`, `result.error`) |
 | `no_reply` | failed | No VT reply in time: hung firmware or a build without `VT_CONTROL` |
-| `device_error` | failed | The firmware answered `err` to `clear` |
+| `device_error` | failed | The firmware answered `err` to `clear`, `ap-start` or `prov-start` |
+| `wrong_transport` | failed | `ble-advertise` on a soft-AP build: use `broadcast-ssid` |
+| `unsupported` | failed | `ble-advertise` on firmware without `prov-start` (`unknown command`) |
 | `not_ready` | failed | No `@vt - ready` after a reset or flash |
 | `bad_request` | error | `script` has no rule lines |
 | `bad_firmware` | error | `firmware_dir` has no usable `flasher_args.json` or images |

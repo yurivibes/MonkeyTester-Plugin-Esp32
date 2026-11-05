@@ -12,9 +12,12 @@ import time
 
 class FakeFirmware:
     def __init__(self, mac="7c:df:a1:a4:8f:44", vt=True, boot_delay=0.05,
-                 ready_on_boot=True):
+                 ready_on_boot=True, transport="softap"):
         self.mac = mac
         self.vt = vt
+        # "softap" or "ble": the build's provisioning transport. None: firmware
+        # from before prov-start (no transport/prov_on/ble_name in its status).
+        self.transport = transport
         self.boot_delay = boot_delay
         self.ready_on_boot = ready_on_boot
         self.port = None  # FakeSerial currently attached
@@ -26,6 +29,7 @@ class FakeFirmware:
     provisioned_ssid = "External"
     ap_on = False
     ap_seconds = None
+    prov_on = False
 
     def _reset_state(self):
         self.rules = {}  # (method, path) -> response text
@@ -33,9 +37,13 @@ class FakeFirmware:
         self.mqtt = "on"
 
     def status(self):
-        return {"proto": 2, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
-                "ip": "", "ssid": self.provisioned_ssid or "MyAccessPoint",
-                "ap_ssid": "BJF-" + self.mac.replace(":", "")[6:], "ap_on": self.ap_on, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
+        name = "BJF-" + self.mac.replace(":", "")[6:]
+        st = {"proto": 2, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
+              "ip": "", "ssid": self.provisioned_ssid or "MyAccessPoint",
+              "ap_ssid": name, "ap_on": self.ap_on, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
+        if self.transport is not None:
+            st.update(transport=self.transport, prov_on=self.prov_on, ble_name=name)
+        return st
 
     # -- device output --
     def emit(self, line):
@@ -121,10 +129,11 @@ class FakeFirmware:
             if cmd == "factory-reset":
                 self.provisioned_ssid = ""
             return {"rebooting": True}
-        if cmd == "ap-start":
+        if cmd == "ap-start" or (cmd == "prov-start" and self.transport is not None):
             if args and (not args[0].isdigit() or int(args[0]) > 86400):
                 raise ValueError("bad seconds (0-86400)")
-            self.ap_on = True
+            self.prov_on = True
+            self.ap_on = self.transport != "ble"  # BLE builds have no soft-AP
             self.ap_seconds = int(args[0]) if args else None
             return self.status()
         raise ValueError("unknown command")
