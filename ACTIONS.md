@@ -50,7 +50,8 @@ END
 The plugin doesn't interpret the rules. It drops blank and `#` lines and sends
 each line as `rule <line>` over the VT control protocol, nothing else. The rule
 language belongs to the firmware: `docs/vt-control.md` in TemperatureSensor
-(HTTP responses with a status and body, `hang`, `delay`, `normal` to undo one
+(HTTP responses with a status and body, `hang`, `delay`, `sequence` for a
+reading whose temperature moves on with each request, `normal` to undo one
 rule, and `wifi`/`mqtt` directives). A later rule for the same method and path
 replaces the earlier one.
 

@@ -274,6 +274,15 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(job["result"]["rules"], 1)
         self.assertEqual(self.fw.rules, {("GET", "/a"): "hang"})
 
+    def test_sequence_rule_is_relayed_unchanged(self):
+        job = self.h.run("expect", {"script": "GET /temperature.json -> sequence 17 18 19"})
+        self.assertEqual(job["state"], "passed", job)
+        sent = [l.split(" ", 2)[2] for l in self.fw.received if l.startswith("@vt p")]
+        self.assertEqual(sent[-1], "rule GET /temperature.json -> sequence 17 18 19")
+        self.assertEqual(self.fw.rules, {("GET", "/temperature.json"): "sequence 17 18 19"})
+        job = self.h.run("expect", {"script": "GET /temperature.json -> sequence 17 hot"})
+        self.assertEqual(job["state"], "failed", job)
+
     def test_rejected_rule_stops_and_keeps_earlier_state(self):
         self.h.run("expect", {"script": "GET /old -> 500"})
         job = self.h.run("expect", {"script": "GET /a -> 500\nGET /b => 500\nGET /c -> 500"})
