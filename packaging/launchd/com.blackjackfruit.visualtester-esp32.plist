@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- macOS LaunchAgent. Replace CHECKOUT_DIR and PYTHON (a python with pyserial +
-     esptool, e.g. CHECKOUT_DIR/.venv/bin/python), copy to ~/Library/LaunchAgents/,
+<!-- macOS LaunchAgent. Replace CHECKOUT_DIR and PYTHON (a python with pyserial,
+     esptool and zeroconf, e.g. CHECKOUT_DIR/.venv/bin/python), copy to ~/Library/LaunchAgents/,
      then: launchctl load ~/Library/LaunchAgents/com.blackjackfruit.visualtester-esp32.plist -->
 <plist version="1.0">
 <dict>
@@ -15,6 +15,8 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PLUGIN_PORT</key><string>8091</string>
+    <!-- fake hub (no hub board attached): HTTP port, reachable from the LAN -->
+    <key>ESP32_FAKE_HUB_PORT</key><string>8092</string>
     <key>PATH</key><string>CHECKOUT_DIR/.venv/bin:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>

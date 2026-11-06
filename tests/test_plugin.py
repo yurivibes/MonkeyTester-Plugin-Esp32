@@ -28,10 +28,32 @@ from plugin_server import PluginServer  # noqa: E402
 TERMINAL = {"passed", "failed", "timeout", "error", "cancelled"}
 
 
+class FakeAdvertiser:
+    """Stands in for fake_hub.MdnsAdvertiser: records start/stop, no multicast."""
+    instances = []
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.started = self.stopped = False
+        FakeAdvertiser.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
 class Harness:
-    def __init__(self, token=None, vt=True, ports=("/dev/fake0",)):
-        self.fws = {p: FakeFirmware(mac=f"7c:df:a1:a4:8f:{i:02x}", vt=vt)
-                    for i, p in enumerate(ports)}
+    """roles: one FakeFirmware role per port (None = firmware from before roles).
+    fake_hub: the plugin's ESP32_FAKE_HUB mode; None = read the environment."""
+
+    def __init__(self, token=None, vt=True, ports=("/dev/fake0",), roles=None,
+                 fake_hub="off", transport="softap"):
+        roles = roles or (None,) * len(ports)
+        self.fws = {p: FakeFirmware(mac=f"7c:df:a1:a4:8f:{i:02x}", vt=vt, role=r,
+                                    transport=transport)
+                    for i, (p, r) in enumerate(zip(ports, roles))}
         self.opens = {p: 0 for p in ports}
 
         def opener(board):
@@ -55,7 +77,11 @@ class Harness:
         self._orig_board = orig_board
         self._orig_candidates = Esp32Plugin._candidate_ports
         Esp32Plugin._candidate_ports = lambda s: list(ports)
-        self.plugin = Esp32Plugin(ports=list(ports), rescan=False)
+        FakeAdvertiser.instances = []
+        self.plugin = Esp32Plugin(ports=list(ports), rescan=False, fake_hub_mode=fake_hub,
+                                  fake_hub_port=0, fake_hub_bind="127.0.0.1",
+                                  fake_hub_address="127.0.0.1",
+                                  mdns_advertiser=FakeAdvertiser, log=lambda m: None)
         self.server = PluginServer(self.plugin, "127.0.0.1", 0, token)
         self.plugin.jobs = self.server.jobs
         self.server.start_background()
@@ -65,9 +91,11 @@ class Harness:
         end = time.time() + 5
         while time.time() < end and any(b.vt is None for b in self.plugin.boards()):
             time.sleep(0.02)
+        self.plugin.update_fake_hub()
 
     def close(self):
         self.server.shutdown()
+        self.plugin.close()
         for b in self.plugin.boards():
             b.stop()
         esp32_plugin.Board = self._orig_board
@@ -132,7 +160,7 @@ class ContractTests(unittest.TestCase):
         code, a = self.h.call("GET", "/actions")
         names = {x["name"]: x for x in a["actions"]}
         self.assertEqual(sorted(names), ["ble-advertise", "broadcast-ssid", "clear", "expect",
-                                         "factory-reset", "flash", "reset"])
+                                         "factory-reset", "flash", "forget", "reset"])
         self.assertEqual(names["flash"]["params"]["firmware_dir"]["type"], "path")
         self.assertEqual(names["expect"]["params"]["script"],
                          {"type": "string", "required": True,

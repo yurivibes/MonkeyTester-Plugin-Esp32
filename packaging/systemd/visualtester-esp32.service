@@ -10,6 +10,10 @@ After=network-online.target
 WorkingDirectory=%h/Workspace/VisualTester-Esp32
 ExecStart=/usr/bin/env nix run .
 Environment=PLUGIN_PORT=8091
+# Fake hub (when no hub board is attached): HTTP on 8092, mDNS tshub-fake.
+# Open TCP 8092 and UDP 5353 to the LAN.
+#Environment=ESP32_FAKE_HUB=auto
+#Environment=ESP32_FAKE_HUB_PORT=8092
 Restart=on-failure
 RestartSec=5
 
