@@ -22,40 +22,70 @@ sys.path.insert(0, HERE)
 os.environ.setdefault("ESP32_READY_TIMEOUT_S", "3")
 import esp32_plugin  # noqa: E402
 from esp32_plugin import Esp32Plugin  # noqa: E402
-from fake_board import FakeFirmware, FakeSerial  # noqa: E402
+from fake_board import FakeFirmware, FakeSerial, SENSOR_NO_HTTP, UsjNodes  # noqa: E402
+from board import port_kind  # noqa: E402
 from plugin_server import PluginServer  # noqa: E402
 
 TERMINAL = {"passed", "failed", "timeout", "error", "cancelled"}
 
 
+class FakeAdvertiser:
+    """Stands in for fake_hub.MdnsAdvertiser: records start/stop, no multicast."""
+    instances = []
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.started = self.stopped = False
+        FakeAdvertiser.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+
 class Harness:
-    def __init__(self, token=None, vt=True, ports=("/dev/fake0",)):
-        self.fws = {p: FakeFirmware(mac=f"7c:df:a1:a4:8f:{i:02x}", vt=vt)
-                    for i, p in enumerate(ports)}
+    """roles: one FakeFirmware role per port (None = firmware from before roles).
+    fake_hub: the plugin's ESP32_FAKE_HUB mode; None = read the environment.
+    macs: the firmware MACs, one per port (a board on its own USJ port reports
+    the same MAC in its USB metadata)."""
+
+    def __init__(self, token=None, vt=True, ports=("/dev/fake0",), roles=None,
+                 fake_hub="off", transport="softap", macs=None):
+        roles = roles or (None,) * len(ports)
+        macs = macs or tuple(f"7c:df:a1:a4:8f:{i:02x}" for i in range(len(ports)))
+        self.fws = {p: FakeFirmware(mac=m, vt=vt, role=r, transport=transport)
+                    for i, (p, r, m) in enumerate(zip(ports, roles, macs))}
         self.opens = {p: 0 for p in ports}
+        self.fw_opens = {}  # per firmware: a USJ board's node index moves, its MAC does not
 
         def opener(board):
             def open_():
                 fw = self.fws[board.port]
-                self.opens[board.port] += 1
-                s = FakeSerial(fw, board.port)
-                if self.opens[board.port] > 1:  # reopened after esptool: it reset the chip
+                self.opens[board.port] = self.opens.get(board.port, 0) + 1
+                self.fw_opens[fw] = self.fw_opens.get(fw, 0) + 1
+                if self.fw_opens[fw] > 1:  # reopened after esptool: it reset the chip
                     fw.boot()
-                return s
+                return FakeSerial(fw, board.port)
             return open_
 
         orig_board = esp32_plugin.Board
 
         class TestBoard(orig_board):
-            def __init__(b, port, baud, events, open_serial=None):
-                super().__init__(port, baud, events)
+            def __init__(b, port, baud, events, **kw):
+                super().__init__(port, baud, events, **kw)
                 b._open_serial = opener(b)
 
         esp32_plugin.Board = TestBoard
         self._orig_board = orig_board
         self._orig_candidates = Esp32Plugin._candidate_ports
         Esp32Plugin._candidate_ports = lambda s: list(ports)
-        self.plugin = Esp32Plugin(ports=list(ports), rescan=False)
+        FakeAdvertiser.instances = []
+        self.plugin = Esp32Plugin(ports=list(ports), rescan=False, fake_hub_mode=fake_hub,
+                                  fake_hub_port=0, fake_hub_bind="127.0.0.1",
+                                  fake_hub_address="127.0.0.1",
+                                  mdns_advertiser=FakeAdvertiser, log=lambda m: None)
         self.server = PluginServer(self.plugin, "127.0.0.1", 0, token)
         self.plugin.jobs = self.server.jobs
         self.server.start_background()
@@ -65,9 +95,11 @@ class Harness:
         end = time.time() + 5
         while time.time() < end and any(b.vt is None for b in self.plugin.boards()):
             time.sleep(0.02)
+        self.plugin.update_fake_hub()
 
     def close(self):
         self.server.shutdown()
+        self.plugin.close()
         for b in self.plugin.boards():
             b.stop()
         esp32_plugin.Board = self._orig_board
@@ -103,6 +135,28 @@ class Harness:
                 return job
 
 
+def make_result_build(tmp: str) -> str:
+    """A minimal ESP-IDF build dir under `tmp`: flasher_args.json plus the images
+    it names. Returns the `result/build` path."""
+    build = os.path.join(tmp, "result", "build")
+    os.makedirs(os.path.join(build, "bootloader"))
+    os.makedirs(os.path.join(build, "partition_table"))
+    for rel in ("bootloader/bootloader.bin", "partition_table/partition-table.bin",
+                "temp_sensor.bin"):
+        with open(os.path.join(build, rel), "wb") as f:
+            f.write(b"\0" * 64)
+    with open(os.path.join(build, "flasher_args.json"), "w") as f:
+        json.dump({
+            "write_flash_args": ["--flash_mode", "dio", "--flash_size", "2MB",
+                                 "--flash_freq", "80m"],
+            "flash_files": {"0x0": "bootloader/bootloader.bin",
+                            "0x8000": "partition_table/partition-table.bin",
+                            "0x10000": "temp_sensor.bin"},
+            "extra_esptool_args": {"after": "hard_reset", "before": "default_reset",
+                                   "stub": True, "chip": "esp32c3"}}, f)
+    return build
+
+
 class ContractTests(unittest.TestCase):
     def setUp(self):
         self.h = Harness()
@@ -131,8 +185,8 @@ class ContractTests(unittest.TestCase):
     def test_actions_have_schemas(self):
         code, a = self.h.call("GET", "/actions")
         names = {x["name"]: x for x in a["actions"]}
-        self.assertEqual(sorted(names), ["broadcast-ssid", "clear", "expect", "factory-reset",
-                                         "flash", "reset"])
+        self.assertEqual(sorted(names), ["ble-advertise", "broadcast-ssid", "clear", "expect",
+                                         "factory-reset", "flash", "forget", "reset"])
         self.assertEqual(names["flash"]["params"]["firmware_dir"]["type"], "path")
         self.assertEqual(names["expect"]["params"]["script"],
                          {"type": "string", "required": True,
@@ -322,6 +376,38 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(job["state"], "failed")
         self.assertEqual(job["error"]["code"], "device_error")
 
+    def test_ble_advertise(self):
+        self.fw.transport = "ble"
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual((job["result"]["name"], job["result"]["transport"]), ("BJF-a48f00", "ble"))
+        self.assertTrue(job["result"]["status"]["prov_on"])
+        self.assertFalse(job["result"]["status"]["ap_on"])
+        self.assertIsNone(self.fw.ap_seconds)
+        self.assertTrue(self.fw.received[-1].endswith(" prov-start"))
+        job = self.h.run("ble-advertise", {"seconds": "0"})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertTrue(self.fw.received[-1].endswith(" prov-start 0"))
+        self.assertEqual(self.fw.ap_seconds, 0)
+        job = self.h.run("ble-advertise", {"seconds": 99999})
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "device_error")
+
+    def test_ble_advertise_on_softap_build_fails(self):
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "wrong_transport")
+        self.assertIn("use broadcast-ssid", job["error"]["message"])
+
+    def test_ble_advertise_on_old_firmware_fails(self):
+        self.fw.transport = None
+        job = self.h.run("ble-advertise")
+        self.assertEqual(job["state"], "failed")
+        self.assertEqual(job["error"]["code"], "unsupported")
+        self.assertIn("firmware too old for prov-start", job["error"]["message"])
+        # broadcast-ssid still works on that firmware
+        self.assertEqual(self.h.run("broadcast-ssid")["state"], "passed")
+
     def test_empty_script_is_error(self):
         job = self.h.run("expect", {"script": "  \n# nothing\n"})
         self.assertEqual(job["state"], "error")
@@ -361,22 +447,7 @@ class ActionTests(unittest.TestCase):
 class FlashTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self.build = os.path.join(self.tmp, "result", "build")
-        os.makedirs(os.path.join(self.build, "bootloader"))
-        os.makedirs(os.path.join(self.build, "partition_table"))
-        for rel in ("bootloader/bootloader.bin", "partition_table/partition-table.bin",
-                    "temp_sensor.bin"):
-            with open(os.path.join(self.build, rel), "wb") as f:
-                f.write(b"\0" * 64)
-        with open(os.path.join(self.build, "flasher_args.json"), "w") as f:
-            json.dump({
-                "write_flash_args": ["--flash_mode", "dio", "--flash_size", "2MB",
-                                     "--flash_freq", "80m"],
-                "flash_files": {"0x0": "bootloader/bootloader.bin",
-                                "0x8000": "partition_table/partition-table.bin",
-                                "0x10000": "temp_sensor.bin"},
-                "extra_esptool_args": {"after": "hard_reset", "before": "default_reset",
-                                       "stub": True, "chip": "esp32c3"}}, f)
+        self.build = make_result_build(self.tmp)
         self.log = os.path.join(self.tmp, "esptool.log")
         os.environ["ESPTOOL"] = f"{sys.executable} {os.path.join(HERE, 'fake_esptool.py')}"
         os.environ["FAKE_ESPTOOL_LOG"] = self.log
@@ -435,6 +506,200 @@ class MultiBoardTests(unittest.TestCase):
             self.assertEqual(h.fws["/dev/fake0"].rules, {})
         finally:
             h.close()
+
+
+class UsjHarness(Harness):
+    """A board reached over its own USB-Serial-JTAG interface: `port_kind` calls
+    it `usb-serial-jtag`, so there is no RTS pin to pulse and `reset` runs the
+    fake esptool instead, whose hard reset moves the fake node index
+    (`/dev/ttyACM9` -> `/dev/ttyACM10`; index 9 keeps the fake clear of any real
+    board, and the fake port is never opened). `usb_mac` is pinned to None:
+    plain nodes whose udev name can't be read, so the firmware's status gives the
+    board its MAC and the rebind has to survive without USB metadata."""
+
+    def __init__(self, first="/dev/ttyACM9", macs=("7c:df:a1:a4:8f:00",), gap=0, **kw):
+        self.log = os.path.join(tempfile.mkdtemp(), "esptool.log")
+        os.environ["ESPTOOL"] = f"{sys.executable} {os.path.join(HERE, 'fake_esptool.py')}"
+        os.environ["FAKE_ESPTOOL_LOG"] = self.log
+        self.nodes = UsjNodes(first, self.log, gap=gap)
+        self._orig_usb_mac = esp32_plugin.usb_mac
+        esp32_plugin.usb_mac = lambda port: None
+        try:
+            super().__init__(ports=(first,), macs=macs, **kw)
+        except Exception:
+            esp32_plugin.usb_mac = self._orig_usb_mac
+            raise
+        # discovery ran against the static port list; from now on the fake node
+        # enumeration moves with every esptool run
+        Esp32Plugin._candidate_ports = lambda s: self.nodes.ports()
+        for i in range(1, 5):  # the nodes the index may move to: one board, one firmware
+            self.fws[f"{self.nodes.base}{self.nodes.first + i}"] = self.fws[first]
+
+    def close(self):
+        esp32_plugin.usb_mac = self._orig_usb_mac
+        for k in ("ESPTOOL", "FAKE_ESPTOOL_LOG", "FAKE_ESPTOOL_RC"):
+            os.environ.pop(k, None)
+        super().close()
+
+
+class TransportTests(unittest.TestCase):
+    """The two transports and the identity a native port's metadata gives: no
+    harness, no filesystem, no real ports."""
+
+    BY_ID_USJ = ("/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit"
+                 "-AC:27:6E:FA:BB:5C-if00")
+    BY_ID_BRIDGE = ("/dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART"
+                    "_Bridge_Controller-68a5d5e83f75eb11be527fafb7be2ba5-if00-port0")
+
+    def test_port_kind_reads_the_node_or_its_udev_name(self):
+        self.assertEqual(port_kind("/dev/ttyACM0"), "usb-serial-jtag")
+        self.assertEqual(port_kind("/dev/ttyUSB0"), "uart-bridge")
+        self.assertEqual(port_kind("/dev/cu.usbmodem123"), "usb-serial-jtag")
+        self.assertEqual(port_kind("/dev/cu.usbserial-14A0"), "uart-bridge")
+        self.assertEqual(port_kind("/dev/fake0"), "uart-bridge")
+        self.assertEqual(port_kind(self.BY_ID_USJ), "usb-serial-jtag")
+        self.assertEqual(port_kind(self.BY_ID_BRIDGE), "uart-bridge")
+
+    def test_the_mac_is_the_usb_serial_number(self):
+        self.assertEqual(esp32_plugin.usb_mac(self.BY_ID_USJ), "ac:27:6e:fa:bb:5c")
+        # the bridge's serial number is the adapter's, not a MAC
+        self.assertIsNone(esp32_plugin.usb_mac(self.BY_ID_BRIDGE))
+        self.assertIsNone(esp32_plugin.usb_mac("/dev/fake0"))
+
+    def test_a_cdc_acm_port_rejects_the_pins(self):
+        s = FakeSerial(FakeFirmware(mac="ac:27:6e:fa:bb:5c"), "/dev/ttyACM9")
+        self.assertEqual(s.kind, "usb-serial-jtag")
+        with self.assertRaises(OSError):
+            s.dtr = False
+        with self.assertRaises(OSError):
+            s.rts = True
+
+    def test_the_bridge_still_has_its_pins(self):
+        s = FakeSerial(FakeFirmware(), "/dev/fake0")
+        self.assertEqual(s.kind, "uart-bridge")
+        s.dtr = False
+        s.rts = True
+
+    def test_a_native_board_is_identified_before_it_answers(self):
+        # No VT firmware (vt=False): the MAC comes from the USB metadata alone.
+        h = Harness(ports=(self.BY_ID_USJ,), vt=False,
+                    macs=("ac:27:6e:fa:bb:5c",))
+        try:
+            code, d = h.call("GET", "/devices")
+            self.assertEqual(code, 200)
+            dev = d["devices"][0]
+            self.assertEqual(dev["id"], "ac:27:6e:fa:bb:5c")
+            self.assertEqual(dev["details"]["mac"], "ac:27:6e:fa:bb:5c")
+            self.assertEqual(dev["details"]["port"], self.BY_ID_USJ)
+            self.assertEqual(dev["details"]["port_kind"], "usb-serial-jtag")
+            self.assertFalse(dev["details"]["vt_control"])
+        finally:
+            h.close()
+
+
+class UsjTests(unittest.TestCase):
+    def setUp(self):
+        self.h = UsjHarness()
+        self.b = self.h.plugin.boards()[0]
+        self.fw = next(iter(self.h.fws.values()))
+
+    def tearDown(self):
+        self.h.close()
+
+    def test_devices_says_which_node_and_transport(self):
+        code, d = self.h.call("GET", "/devices")
+        self.assertEqual(code, 200)
+        dev = d["devices"][0]
+        self.assertEqual(dev["details"]["port"], "/dev/ttyACM9")
+        self.assertEqual(dev["details"]["port_kind"], "usb-serial-jtag")
+        self.assertEqual(dev["id"], "7c:df:a1:a4:8f:00")
+
+    def test_reset_resets_with_esptool_and_waits_for_ready(self):
+        before = self.fw.reboots
+        job = self.h.run("reset")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.fw.reboots, before + 1)  # the tool's hard reset, not a pin
+        self.assertEqual(job["result"]["status"]["proto"], 2)
+        with open(self.h.log) as f:
+            argv = json.loads(f.readline())
+        self.assertIn("flash-id", argv)  # identify only: esptool has no reset command
+        self.assertEqual(argv[argv.index("--port") + 1], "/dev/ttyACM9")
+        self.assertNotIn("--baud", argv)  # CDC-ACM: no transfer baud there
+        self.assertNotIn("--serial", argv)  # esptool v5.x takes --port
+
+    def test_the_node_moves_and_the_board_stays_the_same(self):
+        self.assertEqual(self.b.port, "/dev/ttyACM9")
+        job = self.h.run("reset")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.b.port, "/dev/ttyACM10")
+        self.assertEqual(self.b.id, "7c:df:a1:a4:8f:00")  # identity survived the rebind
+        code, d = self.h.call("GET", "/devices")
+        dev = d["devices"][0]
+        self.assertEqual(dev["details"]["port"], "/dev/ttyACM10")
+        self.assertEqual(dev["details"]["port_kind"], "usb-serial-jtag")
+        self.assertEqual(self.h.run("clear")["state"], "passed")  # still the one sensor
+        # the old node is not left behind as a second handle on the board
+        code, r = self.h.call("POST", "/jobs", {"action": "clear", "device": "/dev/ttyACM9"})
+        self.assertEqual((code, r["code"]), (404, "unknown_device"))
+
+    def test_flash_on_a_native_port_omits_baud_and_rebinds(self):
+        build = make_result_build(tempfile.mkdtemp())
+        job = self.h.run("flash", {"firmware_dir": build})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(job["result"]["chip"], "esp32c3")
+        self.assertEqual(self.b.model, "ESP32-C3")
+        with open(self.h.log) as f:
+            argv = json.loads(f.readline())
+        self.assertNotIn("--baud", argv)
+        self.assertEqual(argv[argv.index("--port") + 1], "/dev/ttyACM9")
+        self.assertEqual(self.b.port, "/dev/ttyACM10")  # it came back on the next node
+
+    def test_reset_waits_for_the_node_to_come_back(self):
+        # A real chip drops off the bus after esptool's hard reset: the node is
+        # missing for a moment. The reset waits for it instead of failing.
+        self.h.nodes.gap = 4
+        job = self.h.run("reset")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.b.port, "/dev/ttyACM10")
+        self.assertEqual(self.h.run("clear")["state"], "passed")
+
+    def test_reset_fails_cleanly_when_the_node_never_comes_back(self):
+        self.h.nodes.gap = 10**6
+        old = esp32_plugin.USJ_REAPPEAR_S
+        esp32_plugin.USJ_REAPPEAR_S = 1.0
+        try:
+            job = self.h.run("reset")
+        finally:
+            esp32_plugin.USJ_REAPPEAR_S = old
+            self.h.nodes.gap = 0
+            self.h.nodes._missing = 0
+        self.assertEqual(job["state"], "error", job)
+        self.assertEqual(job["error"]["code"], "port_error")
+
+    def test_esptool_reset_failure_is_an_error_and_the_port_comes_back(self):
+        os.environ["FAKE_ESPTOOL_RC"] = "2"
+        job = self.h.run("reset")
+        self.assertEqual(job["state"], "error")
+        self.assertEqual(job["error"]["code"], "reset_failed")
+        self.assertEqual(self.h.run("clear")["state"], "passed")
+
+    def test_a_moved_node_is_rebound_not_doubled(self):
+        # The board is idle; the fake kernel hands it the next index outside a job
+        # (one more fake esptool run in the log), and discovery re-binds it by MAC
+        # instead of registering the board twice.
+        with open(self.h.log, "a") as f:
+            f.write("[]\n")
+        orig_mac = esp32_plugin.usb_mac
+        esp32_plugin.usb_mac = lambda port: "7c:df:a1:a4:8f:00"  # udev name readable
+        try:
+            self.h.plugin.rescan()
+        finally:
+            esp32_plugin.usb_mac = orig_mac
+        code, d = self.h.call("GET", "/devices")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(d["devices"]), 1)
+        self.assertEqual(self.b.port, "/dev/ttyACM10")
+        self.assertEqual(self.b.id, "7c:df:a1:a4:8f:00")
 
 
 if __name__ == "__main__":

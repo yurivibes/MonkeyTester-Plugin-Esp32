@@ -10,7 +10,8 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        python = pkgs.python3.withPackages (ps: [ ps.pyserial ]);
+        # zeroconf: the fake hub's mDNS advertisement (_tshub._tcp)
+        python = pkgs.python3.withPackages (ps: [ ps.pyserial ps.zeroconf ]);
         src = pkgs.lib.cleanSource ./.;
 
         plugin = pkgs.writeShellApplication {
@@ -33,7 +34,7 @@
         packages.default = plugin;
         packages.visualtester-esp32 = plugin;
 
-        # nix run            -> the plugin on :8091
+        # nix run            -> the plugin on :8091 (+ the fake hub on :8092)
         # nix run .#tests    -> unit tests against the fake board
         apps.default = { type = "app"; program = "${plugin}/bin/visualtester-esp32"; };
         apps.tests = { type = "app"; program = "${tests}/bin/visualtester-esp32-tests"; };

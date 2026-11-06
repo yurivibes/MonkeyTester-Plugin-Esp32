@@ -7,12 +7,19 @@ reader so esptool can have the port.
 
 The protocol itself is specified in the firmware repo (TemperatureSensor,
 docs/vt-control.md).
+
+A board is reached over one of two transports (`port_kind`, see ACTIONS.md): the
+CP2102N UART bridge (`uart-bridge`, `/dev/ttyUSB…`) has a baud rate and an EN/RTS
+pin; the chip's own USB-Serial-JTAG interface (`usb-serial-jtag`, `/dev/ttyACM…`)
+is plain CDC-ACM: the baud rate means nothing there and there is no DTR/RTS to
+touch. Everything else (line splitting, VT routing) is the same.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import os
 import re
 import threading
 import time
@@ -26,6 +33,36 @@ VT_PREFIX = "@vt "
 LINE_HISTORY = 2000
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
+PORT_UART_BRIDGE = "uart-bridge"
+PORT_USB_SERIAL_JTAG = "usb-serial-jtag"
+
+
+def port_kind(port: str) -> str:
+    """Which transport a serial node speaks.
+
+    `uart-bridge`: the CP2102N adapter (`/dev/ttyUSB…`, macOS `cu.usbserial*`) —
+    a real baud rate, and a DTR/RTS pair the auto-reset circuit can pulse.
+    `usb-serial-jtag`: the chip's own interface (`/dev/ttyACM…`, macOS
+    `cu.usbmodem*`) — CDC-ACM: the tty layer ignores the baud rate and pyserial
+    raises for the DTR/RTS ioctls the interface doesn't have.
+
+    udev's by-id name (which the node may be reached through, and which fake
+    test ports carry) says it in the interface class name: "… USB JTAG/serial
+    debug unit" vs "… USB to UART Bridge Controller". Unknown nodes are taken
+    for the bridge, which is what this code assumed before."""
+    for name in (os.path.basename(port), os.path.basename(os.path.realpath(port))):
+        n = name.lower()
+        if n.startswith("ttyacm") or "usbmodem" in n:
+            return PORT_USB_SERIAL_JTAG
+        if n.startswith("ttyusb") or "usbserial" in n:
+            return PORT_UART_BRIDGE
+        n = name.lower().replace("_", " ")
+        if "jtag" in n:
+            return PORT_USB_SERIAL_JTAG
+        if "bridge" in n or "uart" in n:
+            return PORT_UART_BRIDGE
+    return PORT_UART_BRIDGE
+
 
 class VtReply:
     def __init__(self, ok: bool, payload):
@@ -34,11 +71,17 @@ class VtReply:
 
 
 class Board:
-    def __init__(self, port: str, baud: int, events, open_serial=None):
+    def __init__(self, port: str, baud: int, events, open_serial=None,
+                 kind: str | None = None, mac: str | None = None,
+                 reset_tool=None):
         self.port = port
         self.baud = baud
         self.events = events
         self._open_serial = open_serial or self._default_open
+        self._reset_tool = reset_tool
+        # Which transport this node speaks: setting the baud rate or DTR/RTS on a
+        # native USB-Serial-JTAG port makes pyserial raise.
+        self.kind = kind or port_kind(port)
         self._ser = None
         self._lock = threading.RLock()        # guards _ser and writes
         self._cond = threading.Condition()    # lines / replies arrived
@@ -49,11 +92,11 @@ class Board:
         self._paused = threading.Event()
         self._stop = threading.Event()
         self._reader = None
-        self.id: str = port               # replaced by the MAC once known
-        self.mac: str | None = None
-        self.model: str | None = None
-        self.status: dict | None = None   # last status object seen
-        self.vt: bool | None = None       # firmware answers VT control?
+        self.id: str = mac or port          # the MAC when known: from the firmware's
+        self.mac: str | None = mac          # status, or from the USB metadata at
+        self.model: str | None = None       # discovery (its serial number)
+        self.status: dict | None = None     # last status object seen
+        self.vt: bool | None = None         # firmware answers VT control?
         self.last_ready_seq = 0
         self.error: str | None = None
         self.online = False
@@ -63,11 +106,14 @@ class Board:
     def _default_open(self):
         s = serial.Serial()
         s.port = self.port
-        s.baudrate = self.baud
         s.timeout = 0.2
-        # Don't toggle EN/IO0 through the auto-reset circuit just by opening.
-        s.dtr = False
-        s.rts = False
+        if self.kind == PORT_UART_BRIDGE:
+            s.baudrate = self.baud
+            # Don't toggle EN/IO0 through the auto-reset circuit just by opening.
+            s.dtr = False
+            s.rts = False
+        # A native USB-Serial-JTAG port is CDC-ACM: it has no baud rate to set and
+        # no DTR/RTS ioctls, and pyserial raises for both, so nothing is set.
         s.open()
         return s
 
@@ -161,17 +207,19 @@ class Board:
             payload = json.loads(payload_raw) if payload_raw else {}
         except json.JSONDecodeError:
             payload = {"raw": payload_raw}
+        # Learn the status (and so the role) before `vt` is set: the plugin decides
+        # whether to run the fake hub once no board has `vt is None`.
         if rid == "-":
             if kind == "ready":
+                self._learn(payload)
                 self.last_ready_seq = seq
                 self.vt = True
-                self._learn(payload)
             return
         if kind in ("ok", "err"):
-            self.vt = True
-            self._replies[rid] = VtReply(kind == "ok", payload)
             if kind == "ok" and isinstance(payload, dict) and "proto" in payload:
                 self._learn(payload)
+            self.vt = True
+            self._replies[rid] = VtReply(kind == "ok", payload)
 
     def _learn(self, payload) -> None:
         if not isinstance(payload, dict):
@@ -249,8 +297,20 @@ class Board:
 
     # ───────────── reset ─────────────
 
-    def hard_reset(self) -> None:
-        """Pulse EN through the USB-UART's RTS line (standard dev-board wiring)."""
+    def hard_reset(self, ctx: JobContext | None = None) -> None:
+        """Reset the board on whichever transport it is on.
+
+        `uart-bridge`: pulse EN through the adapter's RTS pin (standard dev-board
+        wiring). `usb-serial-jtag`: the native interface has no RTS pin at all, so
+        the reset is esptool on this same port — `self._reset_tool`, installed by
+        the plugin, which ends with esptool's own hard reset and rebinds the Board
+        when the kernel re-created the interface under a new node index."""
+        if self.kind != PORT_UART_BRIDGE:
+            if self._reset_tool is None:
+                raise ActionError(f"{self.port} has no RTS pin and no tool to reset "
+                                  f"it with", code="no_reset_pin")
+            self._reset_tool(self, ctx)
+            return
         with self._lock:
             if self._ser is None:
                 raise ActionError(f"{self.port} is not open", code="port_closed")
@@ -259,7 +319,24 @@ class Board:
             time.sleep(0.12)
             self._ser.rts = False
 
+    def rebind(self, port: str) -> None:
+        """Adopt a new device node (the ttyACM index moves when the kernel
+        re-creates the interface after esptool's hard reset). Identity is the MAC,
+        so the id, the published events and `device=` references survive."""
+        if port == self.port:
+            return
+        self.port = port
+        self.kind = port_kind(port)
+
     # ───────────── description ─────────────
+
+    @property
+    def role(self) -> str:
+        """`sensor` or `hub`, from the firmware's status. Firmware from before
+        roles (no `role` field) and boards that don't answer VT control count
+        as sensors."""
+        role = (self.status or {}).get("role")
+        return role if role in ("sensor", "hub") else "sensor"
 
     def to_json(self, busy: bool) -> dict:
         if not self.online:
@@ -270,9 +347,13 @@ class Board:
             state = "busy"
         else:
             state = "ready"
-        details = {"port": self.port, "vt_control": self.vt}
+        details = {"port": self.port, "port_kind": self.kind, "vt_control": self.vt,
+                   "role": self.role}
+        if self.mac:
+            details["mac"] = self.mac
         if self.status:
-            for k in ("device", "ip", "ssid", "ap_ssid"):
+            for k in ("device", "ip", "ssid", "ap_ssid", "hub", "report", "last_report",
+                      "sensors", "time_synced"):
                 if k in self.status:
                     details[k] = self.status[k]
         if self.error:
