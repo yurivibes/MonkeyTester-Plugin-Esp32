@@ -68,6 +68,8 @@ RESCAN_S = 5.0
 READY_TIMEOUT_S = float(os.environ.get("ESP32_READY_TIMEOUT_S", "20"))
 FAKE_HUB_MODES = ("auto", "on", "off")
 IDENTIFY_WAIT_S = 3.0
+# A native USB-Serial-JTAG node vanishes and comes back after a chip reset.
+USJ_REAPPEAR_S = float(os.environ.get("ESP32_USJ_REAPPEAR_S", "10"))
 _MAC_IN_NAME = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 
 
@@ -375,15 +377,40 @@ class Esp32Plugin(Plugin):
         return cands[0] if len(cands) == 1 else None
 
     def _reopen_after_tool(self, ctx: JobContext | None, b: Board) -> None:
-        """Reopen the port after esptool, which ends with its own hard reset."""
-        if b.kind != PORT_UART_BRIDGE:
+        """Reopen the port after esptool, which ends with its own hard reset.
+
+        On a native USB-Serial-JTAG port that reset makes the chip drop off the
+        bus: the node (and its by-id link) vanishes for a moment and comes back,
+        possibly under a new index, and udev may not have set its permissions
+        yet. Wait for it (USJ_REAPPEAR_S) and retry the open until then instead
+        of failing the job on the first try."""
+        if b.kind == PORT_UART_BRIDGE:
+            b.resume()
+            return
+        deadline = time.monotonic() + USJ_REAPPEAR_S
+        time.sleep(0.3)  # let the old node go away before looking for it
+        last = None
+        while True:
             new = self._node_after_reset(b)
             if new:
                 self._rebind(b, new)
                 if ctx:
                     ctx.log(f"the kernel re-created the interface as {new} "
                             f"(still the board {b.id})")
-        b.resume()
+            real = os.path.realpath(b.port)
+            if any(os.path.realpath(q) == real for q in self._candidate_ports()):
+                try:
+                    b.resume()
+                    return
+                except Exception as e:  # noqa: BLE001 - node not ready yet
+                    last = e
+            if time.monotonic() >= deadline:
+                if last is not None:
+                    raise last
+                raise ActionError(f"{b.port} did not come back within "
+                                  f"{USJ_REAPPEAR_S:g} s after the reset",
+                                  code="port_error")
+            time.sleep(0.2)
 
     def _tool_hard_reset(self, b: Board, ctx: JobContext | None) -> None:
         """Reset a board whose port has no RTS pin (native USJ): esptool on that

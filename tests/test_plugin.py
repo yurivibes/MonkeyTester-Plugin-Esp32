@@ -517,11 +517,11 @@ class UsjHarness(Harness):
     plain nodes whose udev name can't be read, so the firmware's status gives the
     board its MAC and the rebind has to survive without USB metadata."""
 
-    def __init__(self, first="/dev/ttyACM9", macs=("7c:df:a1:a4:8f:00",), **kw):
+    def __init__(self, first="/dev/ttyACM9", macs=("7c:df:a1:a4:8f:00",), gap=0, **kw):
         self.log = os.path.join(tempfile.mkdtemp(), "esptool.log")
         os.environ["ESPTOOL"] = f"{sys.executable} {os.path.join(HERE, 'fake_esptool.py')}"
         os.environ["FAKE_ESPTOOL_LOG"] = self.log
-        self.nodes = UsjNodes(first, self.log)
+        self.nodes = UsjNodes(first, self.log, gap=gap)
         self._orig_usb_mac = esp32_plugin.usb_mac
         esp32_plugin.usb_mac = lambda port: None
         try:
@@ -653,6 +653,28 @@ class UsjTests(unittest.TestCase):
         self.assertNotIn("--baud", argv)
         self.assertEqual(argv[argv.index("--port") + 1], "/dev/ttyACM9")
         self.assertEqual(self.b.port, "/dev/ttyACM10")  # it came back on the next node
+
+    def test_reset_waits_for_the_node_to_come_back(self):
+        # A real chip drops off the bus after esptool's hard reset: the node is
+        # missing for a moment. The reset waits for it instead of failing.
+        self.h.nodes.gap = 4
+        job = self.h.run("reset")
+        self.assertEqual(job["state"], "passed", job)
+        self.assertEqual(self.b.port, "/dev/ttyACM10")
+        self.assertEqual(self.h.run("clear")["state"], "passed")
+
+    def test_reset_fails_cleanly_when_the_node_never_comes_back(self):
+        self.h.nodes.gap = 10**6
+        old = esp32_plugin.USJ_REAPPEAR_S
+        esp32_plugin.USJ_REAPPEAR_S = 1.0
+        try:
+            job = self.h.run("reset")
+        finally:
+            esp32_plugin.USJ_REAPPEAR_S = old
+            self.h.nodes.gap = 0
+            self.h.nodes._missing = 0
+        self.assertEqual(job["state"], "error", job)
+        self.assertEqual(job["error"]["code"], "port_error")
 
     def test_esptool_reset_failure_is_an_error_and_the_port_comes_back(self):
         os.environ["FAKE_ESPTOOL_RC"] = "2"
