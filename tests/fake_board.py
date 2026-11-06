@@ -10,11 +10,21 @@ import threading
 import time
 
 
+SENSOR_NO_HTTP = "no HTTP server; set rules on the hub"
+
+
 class FakeFirmware:
+    """role: None = sensor firmware from before roles (HTTP rules, no `role` in
+    its status); "sensor" = the hub-era sensor (no HTTP server: HTTP rules are
+    rejected; `report`/`temp` directives); "hub" = the hub board
+    (TemperatureSensor-Hub docs/hub-protocol.md section 6)."""
+
     def __init__(self, mac="7c:df:a1:a4:8f:44", vt=True, boot_delay=0.05,
-                 ready_on_boot=True, transport="softap"):
+                 ready_on_boot=True, transport="softap", role=None):
         self.mac = mac
         self.vt = vt
+        self.role = role
+        self.sensors = set()  # hub: macs it knows
         # "softap" or "ble": the build's provisioning transport. None: firmware
         # from before prov-start (no transport/prov_on/ble_name in its status).
         self.transport = transport
@@ -35,14 +45,27 @@ class FakeFirmware:
         self.rules = {}  # (method, path) -> response text
         self.wifi = "on"
         self.mqtt = "on"
+        self.report = "on"
+        self.temps = None  # `temp` directive values; None = the probe
+
+    hub_host = "tshub-fake.local:8092"
+    last_report = "ok"
 
     def status(self):
+        if self.role == "hub":
+            return {"proto": 2, "role": "hub", "device": "tshub-" + self.mac.replace(":", "")[6:],
+                    "mac": self.mac, "ip": "192.168.125.20", "ssid": "Home",
+                    "rules": len(self.rules), "sensors": len(self.sensors),
+                    "time_synced": True, "wifi": self.wifi}
         name = "BJF-" + self.mac.replace(":", "")[6:]
         st = {"proto": 2, "device": "ts-" + self.mac.replace(":", "")[4:], "mac": self.mac,
               "ip": "", "ssid": self.provisioned_ssid or "MyAccessPoint",
               "ap_ssid": name, "ap_on": self.ap_on, "rules": len(self.rules), "wifi": self.wifi, "mqtt": self.mqtt}
         if self.transport is not None:
             st.update(transport=self.transport, prov_on=self.prov_on, ble_name=name)
+        if self.role == "sensor":
+            st.update(role="sensor", hub=self.hub_host if self.provisioned_ssid else "",
+                      report=self.report, last_report=self.last_report)
         return st
 
     # -- device output --
@@ -86,6 +109,28 @@ class FakeFirmware:
         if len(words) == 2 and words[0] in ("wifi", "mqtt") and words[1] in ("on", "off"):
             setattr(self, words[0], words[1])
             return
+        if self.role == "sensor":
+            if len(words) == 2 and words[0] == "report" and words[1] in ("on", "off"):
+                self.report = words[1]
+                return
+            if words and words[0] == "temp":
+                if words[1:] == ["normal"]:
+                    self.temps = None
+                    return
+                vals = words[1:]
+                if not 1 <= len(vals) <= 8:
+                    raise ValueError("bad temp (1-8 values or normal)")
+                for v in vals:
+                    try:
+                        t = float(v)
+                    except ValueError:
+                        raise ValueError("bad temp value") from None
+                    if not -55 <= t <= 125:
+                        raise ValueError("bad temp value")
+                self.temps = [float(v) for v in vals]
+                return
+            if len(words) >= 2 and words[0] in ("GET", "POST", "ANY"):
+                raise ValueError(SENSOR_NO_HTTP)
         if len(words) < 4 or words[2] != "->":
             raise ValueError("expected <METHOD> <path> -> <response>")
         method, path = words[0], words[1]
@@ -127,8 +172,18 @@ class FakeFirmware:
             return {"rules": len(self.rules)}
         if cmd in ("reboot", "factory-reset"):
             if cmd == "factory-reset":
-                self.provisioned_ssid = ""
+                if self.role == "hub":
+                    self.sensors = set()
+                else:
+                    self.provisioned_ssid = ""
             return {"rebooting": True}
+        if self.role == "hub":
+            if cmd == "forget" and len(args) == 1:
+                if args[0] not in self.sensors:
+                    raise ValueError("unknown device")
+                self.sensors.discard(args[0])
+                return {"sensors": len(self.sensors)}
+            raise ValueError("unknown command")
         if cmd == "ap-start" or (cmd == "prov-start" and self.transport is not None):
             if args and (not args[0].isdigit() or int(args[0]) > 86400):
                 raise ValueError("bad seconds (0-86400)")

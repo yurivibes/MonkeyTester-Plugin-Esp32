@@ -19,6 +19,12 @@ Environment:
                      (default: the current directory)
   ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after a reset (default 20)
   PLUGIN_UPLOAD_DIR  where POST /uploads unpacks zips (default: <tmp>/vt-plugin-uploads)
+  ESP32_FAKE_HUB     auto | on | off: when `device=hub` uses the software fake hub
+                     (default auto: only while no `role: hub` board is attached)
+  ESP32_FAKE_HUB_PORT  fake hub HTTP port   (default 8092)
+  ESP32_FAKE_HUB_BIND  fake hub listen address (default 0.0.0.0)
+  ESP32_FAKE_HUB_ADDR  IPv4 the fake hub advertises over mDNS and reports as its
+                     `ip` (default: the address of the default-route interface)
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -37,6 +44,7 @@ import time
 
 import plugin_server as ps
 from board import Board
+from fake_hub import FAKE_HUB_ID, MAC_RE, FakeHub
 from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobContext,
                            Param, Plugin, PluginServer, Uploads)
 
@@ -49,6 +57,8 @@ DEFAULT_GLOBS = {
 }
 RESCAN_S = 5.0
 READY_TIMEOUT_S = float(os.environ.get("ESP32_READY_TIMEOUT_S", "20"))
+FAKE_HUB_MODES = ("auto", "on", "off")
+IDENTIFY_WAIT_S = 3.0
 
 
 def _env_int(name, default):
@@ -153,7 +163,9 @@ class Esp32Plugin(Plugin):
     capabilities = ["events", "uploads"]
 
     def __init__(self, ports=None, baud=None, flash_baud=None,
-                 open_serial=None, firmware_root=None, rescan=True):
+                 open_serial=None, firmware_root=None, rescan=True,
+                 fake_hub_mode=None, fake_hub_port=None, fake_hub_bind=None,
+                 fake_hub_address=None, mdns_advertiser=None, log=None):
         super().__init__()
         if os.environ.get("PLUGIN_UPLOAD_DIR"):
             self.uploads = Uploads(os.environ["PLUGIN_UPLOAD_DIR"])
@@ -166,8 +178,25 @@ class Esp32Plugin(Plugin):
         self._lock = threading.Lock()
         self._error = None
         self.jobs = None  # set by main() / tests, to report `busy`
+        mode = (fake_hub_mode or os.environ.get("ESP32_FAKE_HUB") or "auto").strip().lower()
+        if mode not in FAKE_HUB_MODES:
+            raise ValueError(f"ESP32_FAKE_HUB must be auto, on or off (got {mode!r})")
+        self.fake_hub_mode = mode
+        self._fake_lock = threading.Lock()
+        self.fake_hub: FakeHub | None = None
+        if mode != "off":
+            self.fake_hub = FakeHub(
+                port=fake_hub_port if fake_hub_port is not None
+                else _env_int("ESP32_FAKE_HUB_PORT", 8092),
+                bind=fake_hub_bind or os.environ.get("ESP32_FAKE_HUB_BIND") or "0.0.0.0",
+                address=fake_hub_address or os.environ.get("ESP32_FAKE_HUB_ADDR") or None,
+                fw=VERSION, advertiser_factory=mdns_advertiser,
+                log=log or (lambda m: print(m, flush=True)))
         self._actions = self._build_actions()
+        self._scanned = False  # no fake-hub decision before the first scan found every board
         self.rescan()
+        self._scanned = True
+        self.update_fake_hub()
         if rescan:
             threading.Thread(target=self._rescan_loop, daemon=True).start()
 
@@ -232,16 +261,67 @@ class Esp32Plugin(Plugin):
             if b.mac:
                 b.id = b.mac
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
-                                                "vt_control": True})
+                                                "vt_control": True, "role": b.role})
         else:
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
                                                 "vt_control": False})
+        self.update_fake_hub()
+
+    # ── the fake hub ──────────────────────────────────────────
+
+    def _identifying(self) -> list:
+        return [b for b in self.boards() if b.online and b.vt is None]
+
+    def update_fake_hub(self) -> None:
+        """Start/stop the fake hub. `on`: always running. `auto`: running while no
+        `role: hub` board is attached (decided once every board has answered or
+        failed its status probe), so sensors and the app move to a real hub as soon
+        as one appears. `off`: never."""
+        hub = self.fake_hub
+        if hub is None or not self._scanned:
+            return
+        with self._fake_lock:
+            if self.fake_hub_mode == "on":
+                want = True
+            else:
+                if self._identifying():
+                    return
+                want = not any(b.role == "hub" for b in self.boards() if b.online)
+            if want and not hub.active:
+                try:
+                    hub.start()
+                except OSError:
+                    self.events.publish(hub.id, "state", {"state": "error", "error": hub.error})
+                    return
+                self.events.publish(hub.id, "state", {"state": "ready", "role": "hub",
+                                                      "fake": True, "url": hub.url})
+            elif not want and hub.active:
+                hub.stop()
+                self.events.publish(hub.id, "state", {"state": "removed", "role": "hub",
+                                                      "fake": True,
+                                                      "reason": "a hub board is attached"})
+
+    def _fake_hub_json(self) -> dict:
+        hub = self.fake_hub
+        busy = bool(self.jobs and self.jobs.is_busy(hub.id))
+        st = hub.status()
+        return {"id": hub.id, "kind": "esp32", "model": "fake hub",
+                "state": "busy" if busy else "ready",
+                "details": {"role": "hub", "fake": True, "mac": hub.mac, "url": hub.url,
+                            "device": st["device"], "ip": st["ip"], "port": st["port"],
+                            "sensors": st["sensors"], "rules": st["rules"],
+                            "mdns": st["mdns"]}}
+
+    def close(self) -> None:
+        if self.fake_hub is not None:
+            self.fake_hub.stop()
 
     def _rescan_loop(self) -> None:
         while True:
             time.sleep(RESCAN_S)
             try:
                 self.rescan()
+                self.update_fake_hub()
             except Exception as e:  # noqa: BLE001
                 self._error = f"rescan failed: {e}"
 
@@ -256,25 +336,79 @@ class Esp32Plugin(Plugin):
         for b in self.boards():
             busy = bool(self.jobs and self.jobs.is_busy(b.id))
             out.append(b.to_json(busy))
+        if self.fake_hub is not None and self.fake_hub.active:
+            out.append(self._fake_hub_json())
         return out
 
     def device_error(self):
-        return self._error
+        if self._error:
+            return self._error
+        if self.fake_hub is not None and self.fake_hub.error:
+            return f"fake hub: {self.fake_hub.error}"
+        return None
+
+    def _wait_identified(self) -> None:
+        end = time.monotonic() + IDENTIFY_WAIT_S
+        while self._identifying() and time.monotonic() < end:
+            time.sleep(0.05)
 
     def resolve_device(self, ref):
-        boards = self.boards()
-        if ref in (None, ""):
-            if len(boards) == 1:
-                return boards[0].id, boards[0]
-            if not boards:
-                raise HttpError(404, "unknown_device", "no ESP32 boards attached")
-            raise HttpError(400, "bad_request",
-                            f"{len(boards)} boards attached; pass 'device' "
-                            f"({', '.join(b.id for b in boards)})")
-        for b in boards:
+        """`device=` is a MAC (or serial port), `sensor`, or `hub`; omitted = `sensor`."""
+        if isinstance(ref, str):
+            ref = ref.strip()
+        if ref in (None, "", "sensor"):
+            return self._resolve_sensor()
+        if ref == "hub":
+            return self._resolve_hub()
+        hub = self.fake_hub
+        if hub is not None and isinstance(ref, str) and ref.lower() in (hub.id, hub.mac):
+            if not hub.active:
+                raise HttpError(404, "unknown_device",
+                                "the fake hub isn't running (a hub board is attached, or "
+                                f"it failed to start: {hub.error})")
+            return hub.id, hub
+        for b in self.boards():
             if ref in (b.id, b.mac, b.port) or os.path.realpath(str(ref)) == os.path.realpath(b.port):
                 return b.id, b
         raise HttpError(404, "unknown_device", f"no board {ref!r}")
+
+    def _resolve_sensor(self):
+        self._wait_identified()
+        boards = self.boards()
+        sensors = [b for b in boards if b.role == "sensor"]
+        if len(sensors) == 1:
+            return sensors[0].id, sensors[0]
+        if not sensors:
+            others = f" (attached: {', '.join(f'{b.id} [{b.role}]' for b in boards)})" \
+                if boards else ""
+            raise HttpError(404, "unknown_device", f"no sensor board attached{others}")
+        raise HttpError(400, "bad_request",
+                        f"{len(sensors)} sensor boards attached; pass device=<mac> "
+                        f"({', '.join(b.id for b in sensors)})")
+
+    def _resolve_hub(self):
+        hub = self.fake_hub
+        if self.fake_hub_mode == "on":
+            self.update_fake_hub()
+            if not hub.active:
+                raise HttpError(404, "unknown_device", f"the fake hub isn't running: {hub.error}")
+            return hub.id, hub
+        self._wait_identified()
+        hubs = [b for b in self.boards() if b.role == "hub"]
+        if len(hubs) == 1:
+            return hubs[0].id, hubs[0]
+        if len(hubs) > 1:
+            raise HttpError(400, "bad_request",
+                            f"{len(hubs)} hub boards attached; pass device=<mac> "
+                            f"({', '.join(b.id for b in hubs)})")
+        if hub is None:
+            raise HttpError(404, "unknown_device",
+                            "no hub board attached (and ESP32_FAKE_HUB=off)")
+        self.update_fake_hub()
+        if not hub.active:
+            raise HttpError(404, "unknown_device", f"no hub board attached and the fake hub "
+                            f"isn't running: {hub.error}")
+        return hub.id, hub
 
     def resolve_path(self, value: str) -> str:
         if value.startswith("upload:"):
@@ -330,22 +464,59 @@ class Esp32Plugin(Plugin):
                                      "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
                    default_timeout_ms=10_000),
             Action("expect",
-                   "Apply changes to how the board answers the app: each line of `script` is "
+                   "Apply changes to how the device answers the app: each line of `script` is "
                    "sent as a rule, on top of the rules already loaded (state only what "
                    "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
                    "The rule language is the firmware's (TemperatureSensor "
-                   "docs/vt-control.md); blank and # lines are skipped. Stops at the first "
-                   "line the board rejects.",
+                   "docs/vt-control.md, hub-protocol.md section 6): HTTP rules go to "
+                   "device=hub (the fake hub applies them itself), `report`/`temp`/`wifi` "
+                   "directives to the sensor. Blank and # lines are skipped. Stops at the "
+                   "first line the device rejects.",
                    self.act_expect,
                    {"script": Param("string", "rule lines, one per line (the test's inline "
                                     "block)", required=True)},
                    default_timeout_ms=30_000),
             Action("clear", "Drop every expectation: the board behaves normally again.",
                    self.act_clear, default_timeout_ms=10_000),
+            Action("forget",
+                   "Hub only (device=hub): forget a sensor, like DELETE /devices/<mac> "
+                   "(registry entry and history). A sensor that still reports registers "
+                   "again on its next report.",
+                   self.act_forget,
+                   {"mac": Param("string", "the sensor's MAC (aa:bb:cc:dd:ee:ff)",
+                                 required=True)},
+                   default_timeout_ms=10_000),
         ]
         return {a.name: a for a in acts}
 
     # helpers
+
+    @staticmethod
+    def _fake(ctx: JobContext) -> FakeHub | None:
+        return ctx.device if isinstance(ctx.device, FakeHub) else None
+
+    def _not_on_fake_hub(self, ctx: JobContext, action: str) -> None:
+        if self._fake(ctx):
+            raise ActionError(f"{action} is not supported on the fake hub (it is software on "
+                              "the plugin host: no firmware, reset line or radio)",
+                              code="unsupported")
+
+    @staticmethod
+    def _sensor_only(ctx: JobContext, action: str) -> None:
+        b = ctx.device
+        if isinstance(b, Board) and b.role == "hub":
+            raise ActionError(f"{action} is a sensor action; the hub board has no "
+                              "provisioning window (its Wi-Fi is set at build time)",
+                              code="wrong_role")
+
+    @staticmethod
+    def _rule_rejected(n: int, rule: str, msg) -> ActionFailed:
+        return ActionFailed(
+            f"rule {n} rejected by the board: {msg}: {rule} "
+            f"(lines 1-{n - 1} of this block were applied)" if n > 1 else
+            f"rule {n} rejected by the board: {msg}: {rule}",
+            code="rule_rejected",
+            result={"line": n, "rule": rule, "error": msg, "applied": n - 1})
 
     def _wait_ready_line(self, ctx: JobContext, b: Board, since_seq: int,
                          probe_after: float | None = None) -> dict:
@@ -380,6 +551,7 @@ class Esp32Plugin(Plugin):
         return dict(b.status or {})
 
     def act_flash(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "flash")
         b: Board = ctx.device
         build_dir, args = find_flasher_args(p["firmware_dir"])
         argv = build_flash_argv(b.port, build_dir, args, p["baud"] or self.flash_baud, p["erase"])
@@ -407,6 +579,7 @@ class Esp32Plugin(Plugin):
         return result
 
     def act_reset(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "reset")
         b: Board = ctx.device
         seq = b.line_seq
         ctx.log("pulsing EN (RTS)")
@@ -416,6 +589,11 @@ class Esp32Plugin(Plugin):
         return {}
 
     def act_factory_reset(self, ctx: JobContext, p: dict):
+        hub = self._fake(ctx)
+        if hub:
+            hub.factory_reset()
+            ctx.log("fake hub: registry, history and rules erased")
+            return {"status": hub.status()}
         b: Board = ctx.device
         seq = b.line_seq
         reply = b.command(ctx, "factory-reset")
@@ -426,11 +604,16 @@ class Esp32Plugin(Plugin):
         if status.get("rules"):
             raise ActionFailed(f"board still has {status['rules']} rule(s) after reboot",
                                result={"status": status})
-        ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
-                f"provisioning ssid {status.get('ap_ssid')!r}")
+        if status.get("role") == "hub":
+            ctx.log(f"factory settings: {status.get('sensors')} sensor(s) known")
+        else:
+            ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
+                    f"provisioning ssid {status.get('ap_ssid')!r}")
         return {"status": status}
 
     def act_broadcast_ssid(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "broadcast-ssid")
+        self._sensor_only(ctx, "broadcast-ssid")
         b: Board = ctx.device
         cmd = "ap-start" if p["seconds"] is None else f"ap-start {p['seconds']}"
         status = b.command(ctx, cmd)
@@ -441,6 +624,8 @@ class Esp32Plugin(Plugin):
         return {"ssid": status.get("ap_ssid"), "status": status}
 
     def act_ble_advertise(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "ble-advertise")
+        self._sensor_only(ctx, "ble-advertise")
         b: Board = ctx.device
         cmd = "prov-start" if p["seconds"] is None else f"prov-start {p['seconds']}"
         reply = b.request(ctx, cmd)
@@ -466,29 +651,52 @@ class Esp32Plugin(Plugin):
         """Apply a block of changes. Nothing is cleared first: rules accumulate on
         the board until a later block overrides them, `-> normal` removes one, or
         `clear` drops them all."""
-        b: Board = ctx.device
         rules = [ln.strip() for ln in p["script"].splitlines()]
         rules = [ln for ln in rules if ln and not ln.startswith("#")]
         if not rules:
             raise ActionError("script has no rules", code="bad_request")
+        hub = self._fake(ctx)
         count = None
         for n, rule in enumerate(rules, 1):
-            reply = b.request(ctx, "rule " + rule)
+            if hub:
+                ctx.log(f"fake hub <- rule {rule}")
+                try:
+                    count = hub.add_rule(rule)
+                except ValueError as e:
+                    raise self._rule_rejected(n, rule, str(e)) from None
+                continue
+            reply = ctx.device.request(ctx, "rule " + rule)
             if not reply.ok:
                 msg = (reply.payload.get("error") if isinstance(reply.payload, dict)
                        else reply.payload)
-                raise ActionFailed(
-                    f"rule {n} rejected by the board: {msg}: {rule} "
-                    f"(lines 1-{n - 1} of this block were applied)" if n > 1 else
-                    f"rule {n} rejected by the board: {msg}: {rule}",
-                    code="rule_rejected",
-                    result={"line": n, "rule": rule, "error": msg, "applied": n - 1})
+                raise self._rule_rejected(n, rule, msg)
             if isinstance(reply.payload, dict):
                 count = reply.payload.get("rules", count)
         return {"rules": count, "applied": len(rules)}
 
     def act_clear(self, ctx: JobContext, p: dict):
+        hub = self._fake(ctx)
+        if hub:
+            hub.clear()
+            return {"rules": 0}
         return ctx.device.command(ctx, "clear")
+
+    def act_forget(self, ctx: JobContext, p: dict):
+        mac = p["mac"].strip().lower()
+        if not MAC_RE.match(mac):
+            raise ActionError(f"bad mac {p['mac']!r} (expected aa:bb:cc:dd:ee:ff)",
+                              code="bad_request")
+        hub = self._fake(ctx)
+        if hub:
+            if not hub.forget(mac):
+                raise ActionFailed(f"the hub doesn't know {mac}", code="device_error",
+                                   result={"mac": mac})
+            return {"forgotten": mac, "sensors": hub.status()["sensors"]}
+        b: Board = ctx.device
+        if b.role != "hub":
+            raise ActionError("forget is a hub action; use device=hub", code="wrong_role")
+        reply = b.command(ctx, f"forget {mac}")
+        return {"forgotten": mac, "reply": reply}
 
 
 def main() -> None:
@@ -496,14 +704,19 @@ def main() -> None:
     server = PluginServer(plugin, os.environ.get("PLUGIN_BIND", "0.0.0.0"),
                           _env_int("PLUGIN_PORT", 8091), os.environ.get("PLUGIN_TOKEN") or None)
     plugin.jobs = server.jobs
+    # systemd/launchd stop with SIGTERM: exit through `finally` so mDNS says goodbye.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"VisualTester-Esp32 {VERSION} (contract {ps.CONTRACT} v{ps.CONTRACT_VERSION}) "
-          f"on :{server.port}; ports {plugin.port_specs}", flush=True)
+          f"on :{server.port}; ports {plugin.port_specs}; fake hub {plugin.fake_hub_mode}",
+          flush=True)
     for b in plugin.boards():
         print(f"  board on {b.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        plugin.close()  # unregister the fake hub's mDNS name
 
 
 if __name__ == "__main__":

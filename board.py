@@ -161,17 +161,19 @@ class Board:
             payload = json.loads(payload_raw) if payload_raw else {}
         except json.JSONDecodeError:
             payload = {"raw": payload_raw}
+        # Learn the status (and so the role) before `vt` is set: the plugin decides
+        # whether to run the fake hub once no board has `vt is None`.
         if rid == "-":
             if kind == "ready":
+                self._learn(payload)
                 self.last_ready_seq = seq
                 self.vt = True
-                self._learn(payload)
             return
         if kind in ("ok", "err"):
-            self.vt = True
-            self._replies[rid] = VtReply(kind == "ok", payload)
             if kind == "ok" and isinstance(payload, dict) and "proto" in payload:
                 self._learn(payload)
+            self.vt = True
+            self._replies[rid] = VtReply(kind == "ok", payload)
 
     def _learn(self, payload) -> None:
         if not isinstance(payload, dict):
@@ -261,6 +263,14 @@ class Board:
 
     # ───────────── description ─────────────
 
+    @property
+    def role(self) -> str:
+        """`sensor` or `hub`, from the firmware's status. Firmware from before
+        roles (no `role` field) and boards that don't answer VT control count
+        as sensors."""
+        role = (self.status or {}).get("role")
+        return role if role in ("sensor", "hub") else "sensor"
+
     def to_json(self, busy: bool) -> dict:
         if not self.online:
             state = "offline"
@@ -270,9 +280,10 @@ class Board:
             state = "busy"
         else:
             state = "ready"
-        details = {"port": self.port, "vt_control": self.vt}
+        details = {"port": self.port, "vt_control": self.vt, "role": self.role}
         if self.status:
-            for k in ("device", "ip", "ssid", "ap_ssid"):
+            for k in ("device", "ip", "ssid", "ap_ssid", "hub", "report", "last_report",
+                      "sensors", "time_synced"):
                 if k in self.status:
                     details[k] = self.status[k]
         if self.error:
