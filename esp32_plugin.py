@@ -5,6 +5,13 @@ Owns the ESP32 boards attached to this host (Linux or macOS) and exposes them
 through the VisualTester Device Plugin API (PLUGIN_API.md in the VisualTester
 repo; generic part in plugin_server.py). Actions are listed in ACTIONS.md.
 
+Boards are reached over one of two transports (board.py:port_kind): the CP2102N
+UART bridge (`uart-bridge`, /dev/ttyUSB*) — a real baud rate and an EN/RTS pin —
+or the chip's own USB-Serial-JTAG interface (`usb-serial-jtag`, /dev/ttyACM*):
+CDC-ACM with no baud rate, no RTS pin (esptool resets it), and a USB serial
+number that is the board's MAC, which identifies it before it answers VT
+control. `GET /devices` reports `details.port_kind`.
+
 Environment:
   PLUGIN_BIND        listen address           (default 0.0.0.0)
   PLUGIN_PORT        listen port              (default 8091)
@@ -13,12 +20,20 @@ Environment:
                      (default: USB-UART ports for this OS, see DEFAULT_GLOBS)
   ESP32_BAUD         console baud rate        (default 115200)
   ESP32_FLASH_BAUD   esptool baud rate        (default 460800)
+                     (both are meaningless on a board's native USB-Serial-JTAG
+                     port — /dev/ttyACM*, CDC-ACM — where nothing is set)
   ESPTOOL            esptool command          (default: `esptool` on PATH, else
                      "<this python> -m esptool")
   ESP32_FIRMWARE_ROOT  relative firmware_dir values resolve against this
                      (default: the current directory)
   ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after a reset (default 20)
   PLUGIN_UPLOAD_DIR  where POST /uploads unpacks zips (default: <tmp>/vt-plugin-uploads)
+  ESP32_FAKE_HUB     auto | on | off: when `device=hub` uses the software fake hub
+                     (default auto: only while no `role: hub` board is attached)
+  ESP32_FAKE_HUB_PORT  fake hub HTTP port   (default 8092)
+  ESP32_FAKE_HUB_BIND  fake hub listen address (default 0.0.0.0)
+  ESP32_FAKE_HUB_ADDR  IPv4 the fake hub advertises over mDNS and reports as its
+                     `ip` (default: the address of the default-route interface)
 """
 
 from __future__ import annotations
@@ -30,13 +45,15 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 
 import plugin_server as ps
-from board import Board
+from board import PORT_USB_SERIAL_JTAG, PORT_UART_BRIDGE, Board, port_kind
+from fake_hub import FAKE_HUB_ID, MAC_RE, FakeHub
 from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobContext,
                            Param, Plugin, PluginServer, Uploads)
 
@@ -49,6 +66,11 @@ DEFAULT_GLOBS = {
 }
 RESCAN_S = 5.0
 READY_TIMEOUT_S = float(os.environ.get("ESP32_READY_TIMEOUT_S", "20"))
+FAKE_HUB_MODES = ("auto", "on", "off")
+IDENTIFY_WAIT_S = 3.0
+# A native USB-Serial-JTAG node vanishes and comes back after a chip reset.
+USJ_REAPPEAR_S = float(os.environ.get("ESP32_USJ_REAPPEAR_S", "10"))
+_MAC_IN_NAME = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 
 
 def _env_int(name, default):
@@ -56,6 +78,29 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except ValueError:
         return default
+
+
+def usb_mac(port: str) -> str | None:
+    """The MAC a serial node's USB metadata reports, if it reports one.
+
+    An ESP32's native USB-Serial-JTAG interface puts the board's MAC in its USB
+    serial number (uppercase colon form, e.g. `AC:27:6E:FA:BB:5C`), and udev puts
+    that serial number in the `/dev/serial/by-id/usb-…` name of the node — so the
+    board is identified at discovery, before it answers VT control. Other
+    interfaces (the CP2102N bridge: its own serial, `68a5…`) don't, and those
+    boards keep being identified by the firmware's `status` as before."""
+    real = os.path.realpath(port)
+    names = [os.path.basename(port), os.path.basename(real)]
+    if not names[1].startswith("usb-"):  # a plain node: look for its by-id link
+        for link in glob.glob("/dev/serial/by-id/*"):
+            if os.path.realpath(link) == real:
+                names.append(os.path.basename(link))
+                break
+    for name in names:
+        m = _MAC_IN_NAME.search(name)
+        if m and MAC_RE.match(m.group(0).lower()):
+            return m.group(0).lower()
+    return None
 
 
 # ───────────────────────────── flashing ─────────────────────────────
@@ -86,7 +131,8 @@ def esptool_command() -> list:
     return [sys.executable, "-m", "esptool"]
 
 
-def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bool) -> list:
+def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bool,
+                     kind: str | None = None) -> list:
     extra = args.get("extra_esptool_args") or {}
     files = args.get("flash_files") or {}
     if not files:
@@ -94,7 +140,11 @@ def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bo
     argv = esptool_command()
     if extra.get("stub") is False:
         argv.append("--no-stub")
-    argv += ["--port", port, "--baud", str(baud)]
+    argv += ["--port", port]
+    if kind != PORT_USB_SERIAL_JTAG:
+        # A native USB-Serial-JTAG port is CDC-ACM: there is no transfer baud
+        # rate there, and esptool takes --port (not --serial) in v5.x.
+        argv += ["--baud", str(baud)]
     if extra.get("chip"):
         argv += ["--chip", extra["chip"]]
     argv += ["--before", extra.get("before", "default_reset"),
@@ -109,6 +159,16 @@ def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bo
             raise ActionError(f"missing image {path}", code="bad_firmware")
         argv += [addr, path]
     return argv
+
+
+def esptool_reset_argv(port: str) -> list:
+    """A reset-only call for a board with no RTS pin (native USJ).
+
+    esptool has no `probe`/`info` command in v5.x and no reset command; an
+    identify command (`flash-id` reads the flash geometry, writes nothing) run
+    with the default `--after hard_reset` ends with esptool's own hard reset,
+    which is what resets the chip on that port."""
+    return esptool_command() + ["--port", port, "--after", "hard_reset", "flash-id"]
 
 
 def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
@@ -153,7 +213,9 @@ class Esp32Plugin(Plugin):
     capabilities = ["events", "uploads"]
 
     def __init__(self, ports=None, baud=None, flash_baud=None,
-                 open_serial=None, firmware_root=None, rescan=True):
+                 open_serial=None, firmware_root=None, rescan=True,
+                 fake_hub_mode=None, fake_hub_port=None, fake_hub_bind=None,
+                 fake_hub_address=None, mdns_advertiser=None, log=None):
         super().__init__()
         if os.environ.get("PLUGIN_UPLOAD_DIR"):
             self.uploads = Uploads(os.environ["PLUGIN_UPLOAD_DIR"])
@@ -166,8 +228,25 @@ class Esp32Plugin(Plugin):
         self._lock = threading.Lock()
         self._error = None
         self.jobs = None  # set by main() / tests, to report `busy`
+        mode = (fake_hub_mode or os.environ.get("ESP32_FAKE_HUB") or "auto").strip().lower()
+        if mode not in FAKE_HUB_MODES:
+            raise ValueError(f"ESP32_FAKE_HUB must be auto, on or off (got {mode!r})")
+        self.fake_hub_mode = mode
+        self._fake_lock = threading.Lock()
+        self.fake_hub: FakeHub | None = None
+        if mode != "off":
+            self.fake_hub = FakeHub(
+                port=fake_hub_port if fake_hub_port is not None
+                else _env_int("ESP32_FAKE_HUB_PORT", 8092),
+                bind=fake_hub_bind or os.environ.get("ESP32_FAKE_HUB_BIND") or "0.0.0.0",
+                address=fake_hub_address or os.environ.get("ESP32_FAKE_HUB_ADDR") or None,
+                fw=VERSION, advertiser_factory=mdns_advertiser,
+                log=log or (lambda m: print(m, flush=True)))
         self._actions = self._build_actions()
+        self._scanned = False  # no fake-hub decision before the first scan found every board
         self.rescan()
+        self._scanned = True
+        self.update_fake_hub()
         if rescan:
             threading.Thread(target=self._rescan_loop, daemon=True).start()
 
@@ -216,7 +295,17 @@ class Esp32Plugin(Plugin):
                     threading.Thread(target=self._identify, args=(known_board,),
                                      daemon=True).start()
                 continue
-            b = Board(port, self.baud, self.events, open_serial=self._open_serial)
+            moved = self._moved_board(port, ports)
+            if moved is not None:
+                # The kernel re-created the interface under a new index: same board,
+                # new node. Rebind it instead of registering the board twice.
+                self._rebind(moved, port)
+                self.events.publish(moved.id, "state",
+                                    {"state": "ready", "port": port,
+                                     "port_kind": moved.kind})
+                continue
+            b = Board(port, self.baud, self.events, open_serial=self._open_serial,
+                      mac=usb_mac(port), reset_tool=self._tool_hard_reset)
             try:
                 b.start()
             except Exception as e:  # noqa: BLE001 - busy/permission: report, retry later
@@ -232,16 +321,175 @@ class Esp32Plugin(Plugin):
             if b.mac:
                 b.id = b.mac
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
-                                                "vt_control": True})
+                                                "port_kind": b.kind,
+                                                "vt_control": True, "role": b.role})
         else:
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
+                                                "port_kind": b.kind,
                                                 "vt_control": False})
+        self.update_fake_hub()
+
+    # ── the device node can move (native USB-Serial-JTAG) ─────────
+
+    def _rebind(self, b: Board, port: str) -> None:
+        """Point the Board and the port map at a new node. The MAC is the board's
+        identity, so this is the same board: jobs, events and `device=` refs
+        follow it; `details.port` says which node it is on now."""
+        with self._lock:
+            self._boards.pop(b.port, None)
+            self._boards[port] = b
+        b.rebind(port)
+
+    def _moved_board(self, port: str, ports: list) -> Board | None:
+        """A Board whose MAC matches this node's USB metadata and whose own node
+        is gone: the kernel re-created the interface under a new index. Skipped
+        while a job owns the board (that job has the port)."""
+        mac = usb_mac(port)
+        if not mac:
+            return None
+        for b in self.boards():
+            if b.mac != mac or b.kind != port_kind(port):
+                continue
+            if self.jobs and self.jobs.is_busy(b.id):
+                continue
+            if any(os.path.realpath(p) == os.path.realpath(b.port) for p in ports):
+                continue
+            return b
+        return None
+
+    def _node_after_reset(self, b: Board) -> str | None:
+        """The node that took over `b`'s interface after esptool's hard reset
+        moved it (an index change on a native port), or None when the node is
+        still there or which node it is can't be told."""
+        ports = self._candidate_ports()
+        real = os.path.realpath(b.port)
+        if any(os.path.realpath(p) == real for p in ports):
+            return None
+        bound = {os.path.realpath(bb.port) for bb in self.boards() if bb is not b}
+        cands = [p for p in ports
+                 if os.path.realpath(p) not in bound and port_kind(p) == b.kind]
+        if b.mac:
+            exact = [p for p in cands if usb_mac(p) == b.mac]
+            if exact:
+                return exact[0]
+            if any(usb_mac(p) for p in cands):  # metadata says: other boards
+                return None
+        return cands[0] if len(cands) == 1 else None
+
+    def _reopen_after_tool(self, ctx: JobContext | None, b: Board) -> None:
+        """Reopen the port after esptool, which ends with its own hard reset.
+
+        On a native USB-Serial-JTAG port that reset makes the chip drop off the
+        bus: the node (and its by-id link) vanishes for a moment and comes back,
+        possibly under a new index, and udev may not have set its permissions
+        yet. Wait for it (USJ_REAPPEAR_S) and retry the open until then instead
+        of failing the job on the first try."""
+        if b.kind == PORT_UART_BRIDGE:
+            b.resume()
+            return
+        deadline = time.monotonic() + USJ_REAPPEAR_S
+        time.sleep(0.3)  # let the old node go away before looking for it
+        last = None
+        while True:
+            new = self._node_after_reset(b)
+            if new:
+                self._rebind(b, new)
+                if ctx:
+                    ctx.log(f"the kernel re-created the interface as {new} "
+                            f"(still the board {b.id})")
+            real = os.path.realpath(b.port)
+            if any(os.path.realpath(q) == real for q in self._candidate_ports()):
+                try:
+                    b.resume()
+                    return
+                except Exception as e:  # noqa: BLE001 - node not ready yet
+                    last = e
+            if time.monotonic() >= deadline:
+                if last is not None:
+                    raise last
+                raise ActionError(f"{b.port} did not come back within "
+                                  f"{USJ_REAPPEAR_S:g} s after the reset",
+                                  code="port_error")
+            time.sleep(0.2)
+
+    def _tool_hard_reset(self, b: Board, ctx: JobContext | None) -> None:
+        """Reset a board whose port has no RTS pin (native USJ): esptool on that
+        same port, which ends with esptool's own hard reset. esptool has no
+        `probe`/`info` command in v5.x; an identify command writes nothing, and
+        ESP32-C3 has no chip id (esptool falls back to the MAC) — not a failure.
+        After it the node may have moved, so the Board rebinds before resuming."""
+        argv = esptool_reset_argv(b.port)
+        b.pause()
+        try:
+            if ctx is None:  # outside a job: no transcript to pump into
+                proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True,
+                                      errors="replace")
+                rc, out = proc.returncode, proc.stdout
+            else:
+                rc, out = run_tool(ctx, argv)
+        finally:
+            self._reopen_after_tool(ctx, b)
+        if rc != 0:
+            tail = "\n".join(out.splitlines()[-5:])
+            raise ActionError(f"esptool reset exited {rc} on {b.port}: {tail}",
+                              code="reset_failed")
+
+    # ── the fake hub ──────────────────────────────────────────
+
+    def _identifying(self) -> list:
+        return [b for b in self.boards() if b.online and b.vt is None]
+
+    def update_fake_hub(self) -> None:
+        """Start/stop the fake hub. `on`: always running. `auto`: running while no
+        `role: hub` board is attached (decided once every board has answered or
+        failed its status probe), so sensors and the app move to a real hub as soon
+        as one appears. `off`: never."""
+        hub = self.fake_hub
+        if hub is None or not self._scanned:
+            return
+        with self._fake_lock:
+            if self.fake_hub_mode == "on":
+                want = True
+            else:
+                if self._identifying():
+                    return
+                want = not any(b.role == "hub" for b in self.boards() if b.online)
+            if want and not hub.active:
+                try:
+                    hub.start()
+                except OSError:
+                    self.events.publish(hub.id, "state", {"state": "error", "error": hub.error})
+                    return
+                self.events.publish(hub.id, "state", {"state": "ready", "role": "hub",
+                                                      "fake": True, "url": hub.url})
+            elif not want and hub.active:
+                hub.stop()
+                self.events.publish(hub.id, "state", {"state": "removed", "role": "hub",
+                                                      "fake": True,
+                                                      "reason": "a hub board is attached"})
+
+    def _fake_hub_json(self) -> dict:
+        hub = self.fake_hub
+        busy = bool(self.jobs and self.jobs.is_busy(hub.id))
+        st = hub.status()
+        return {"id": hub.id, "kind": "esp32", "model": "fake hub",
+                "state": "busy" if busy else "ready",
+                "details": {"role": "hub", "fake": True, "mac": hub.mac, "url": hub.url,
+                            "device": st["device"], "ip": st["ip"], "port": st["port"],
+                            "sensors": st["sensors"], "rules": st["rules"],
+                            "mdns": st["mdns"]}}
+
+    def close(self) -> None:
+        if self.fake_hub is not None:
+            self.fake_hub.stop()
 
     def _rescan_loop(self) -> None:
         while True:
             time.sleep(RESCAN_S)
             try:
                 self.rescan()
+                self.update_fake_hub()
             except Exception as e:  # noqa: BLE001
                 self._error = f"rescan failed: {e}"
 
@@ -256,25 +504,79 @@ class Esp32Plugin(Plugin):
         for b in self.boards():
             busy = bool(self.jobs and self.jobs.is_busy(b.id))
             out.append(b.to_json(busy))
+        if self.fake_hub is not None and self.fake_hub.active:
+            out.append(self._fake_hub_json())
         return out
 
     def device_error(self):
-        return self._error
+        if self._error:
+            return self._error
+        if self.fake_hub is not None and self.fake_hub.error:
+            return f"fake hub: {self.fake_hub.error}"
+        return None
+
+    def _wait_identified(self) -> None:
+        end = time.monotonic() + IDENTIFY_WAIT_S
+        while self._identifying() and time.monotonic() < end:
+            time.sleep(0.05)
 
     def resolve_device(self, ref):
-        boards = self.boards()
-        if ref in (None, ""):
-            if len(boards) == 1:
-                return boards[0].id, boards[0]
-            if not boards:
-                raise HttpError(404, "unknown_device", "no ESP32 boards attached")
-            raise HttpError(400, "bad_request",
-                            f"{len(boards)} boards attached; pass 'device' "
-                            f"({', '.join(b.id for b in boards)})")
-        for b in boards:
+        """`device=` is a MAC (or serial port), `sensor`, or `hub`; omitted = `sensor`."""
+        if isinstance(ref, str):
+            ref = ref.strip()
+        if ref in (None, "", "sensor"):
+            return self._resolve_sensor()
+        if ref == "hub":
+            return self._resolve_hub()
+        hub = self.fake_hub
+        if hub is not None and isinstance(ref, str) and ref.lower() in (hub.id, hub.mac):
+            if not hub.active:
+                raise HttpError(404, "unknown_device",
+                                "the fake hub isn't running (a hub board is attached, or "
+                                f"it failed to start: {hub.error})")
+            return hub.id, hub
+        for b in self.boards():
             if ref in (b.id, b.mac, b.port) or os.path.realpath(str(ref)) == os.path.realpath(b.port):
                 return b.id, b
         raise HttpError(404, "unknown_device", f"no board {ref!r}")
+
+    def _resolve_sensor(self):
+        self._wait_identified()
+        boards = self.boards()
+        sensors = [b for b in boards if b.role == "sensor"]
+        if len(sensors) == 1:
+            return sensors[0].id, sensors[0]
+        if not sensors:
+            others = f" (attached: {', '.join(f'{b.id} [{b.role}]' for b in boards)})" \
+                if boards else ""
+            raise HttpError(404, "unknown_device", f"no sensor board attached{others}")
+        raise HttpError(400, "bad_request",
+                        f"{len(sensors)} sensor boards attached; pass device=<mac> "
+                        f"({', '.join(b.id for b in sensors)})")
+
+    def _resolve_hub(self):
+        hub = self.fake_hub
+        if self.fake_hub_mode == "on":
+            self.update_fake_hub()
+            if not hub.active:
+                raise HttpError(404, "unknown_device", f"the fake hub isn't running: {hub.error}")
+            return hub.id, hub
+        self._wait_identified()
+        hubs = [b for b in self.boards() if b.role == "hub"]
+        if len(hubs) == 1:
+            return hubs[0].id, hubs[0]
+        if len(hubs) > 1:
+            raise HttpError(400, "bad_request",
+                            f"{len(hubs)} hub boards attached; pass device=<mac> "
+                            f"({', '.join(b.id for b in hubs)})")
+        if hub is None:
+            raise HttpError(404, "unknown_device",
+                            "no hub board attached (and ESP32_FAKE_HUB=off)")
+        self.update_fake_hub()
+        if not hub.active:
+            raise HttpError(404, "unknown_device", f"no hub board attached and the fake hub "
+                            f"isn't running: {hub.error}")
+        return hub.id, hub
 
     def resolve_path(self, value: str) -> str:
         if value.startswith("upload:"):
@@ -321,23 +623,68 @@ class Esp32Plugin(Plugin):
                    {"seconds": Param("int", "how long to broadcast; 0 = until provisioned or "
                                      "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
                    default_timeout_ms=10_000),
+            Action("ble-advertise",
+                   "Start BLE provisioning: the board advertises as BJF-<mac> so the app can "
+                   "find and provision it, as if its provisioning button had been held. Needs "
+                   "firmware with `prov-start`; soft-AP builds use broadcast-ssid.",
+                   self.act_ble_advertise,
+                   {"seconds": Param("int", "how long to advertise; 0 = until provisioned or "
+                                     "reboot; default: the firmware's PROVISION_TIMEOUT_S")},
+                   default_timeout_ms=10_000),
             Action("expect",
-                   "Apply changes to how the board answers the app: each line of `script` is "
+                   "Apply changes to how the device answers the app: each line of `script` is "
                    "sent as a rule, on top of the rules already loaded (state only what "
                    "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
                    "The rule language is the firmware's (TemperatureSensor "
-                   "docs/vt-control.md); blank and # lines are skipped. Stops at the first "
-                   "line the board rejects.",
+                   "docs/vt-control.md, hub-protocol.md section 6): HTTP rules go to "
+                   "device=hub (the fake hub applies them itself), `report`/`temp`/`wifi` "
+                   "directives to the sensor. Blank and # lines are skipped. Stops at the "
+                   "first line the device rejects.",
                    self.act_expect,
                    {"script": Param("string", "rule lines, one per line (the test's inline "
                                     "block)", required=True)},
                    default_timeout_ms=30_000),
             Action("clear", "Drop every expectation: the board behaves normally again.",
                    self.act_clear, default_timeout_ms=10_000),
+            Action("forget",
+                   "Hub only (device=hub): forget a sensor, like DELETE /devices/<mac> "
+                   "(registry entry and history). A sensor that still reports registers "
+                   "again on its next report.",
+                   self.act_forget,
+                   {"mac": Param("string", "the sensor's MAC (aa:bb:cc:dd:ee:ff)",
+                                 required=True)},
+                   default_timeout_ms=10_000),
         ]
         return {a.name: a for a in acts}
 
     # helpers
+
+    @staticmethod
+    def _fake(ctx: JobContext) -> FakeHub | None:
+        return ctx.device if isinstance(ctx.device, FakeHub) else None
+
+    def _not_on_fake_hub(self, ctx: JobContext, action: str) -> None:
+        if self._fake(ctx):
+            raise ActionError(f"{action} is not supported on the fake hub (it is software on "
+                              "the plugin host: no firmware, reset line or radio)",
+                              code="unsupported")
+
+    @staticmethod
+    def _sensor_only(ctx: JobContext, action: str) -> None:
+        b = ctx.device
+        if isinstance(b, Board) and b.role == "hub":
+            raise ActionError(f"{action} is a sensor action; the hub board has no "
+                              "provisioning window (its Wi-Fi is set at build time)",
+                              code="wrong_role")
+
+    @staticmethod
+    def _rule_rejected(n: int, rule: str, msg) -> ActionFailed:
+        return ActionFailed(
+            f"rule {n} rejected by the board: {msg}: {rule} "
+            f"(lines 1-{n - 1} of this block were applied)" if n > 1 else
+            f"rule {n} rejected by the board: {msg}: {rule}",
+            code="rule_rejected",
+            result={"line": n, "rule": rule, "error": msg, "applied": n - 1})
 
     def _wait_ready_line(self, ctx: JobContext, b: Board, since_seq: int,
                          probe_after: float | None = None) -> dict:
@@ -372,9 +719,11 @@ class Esp32Plugin(Plugin):
         return dict(b.status or {})
 
     def act_flash(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "flash")
         b: Board = ctx.device
         build_dir, args = find_flasher_args(p["firmware_dir"])
-        argv = build_flash_argv(b.port, build_dir, args, p["baud"] or self.flash_baud, p["erase"])
+        argv = build_flash_argv(b.port, build_dir, args,
+                                p["baud"] or self.flash_baud, p["erase"], b.kind)
         ctx.log(f"flashing {build_dir} -> {b.port}")
         b.pause()
         try:
@@ -382,7 +731,7 @@ class Esp32Plugin(Plugin):
         finally:
             seq = b.line_seq
             try:
-                b.resume()
+                self._reopen_after_tool(ctx, b)
             except Exception as e:  # noqa: BLE001
                 raise ActionError(f"couldn't reopen {b.port} after flashing: {e}",
                                   code="port_error") from None
@@ -399,15 +748,24 @@ class Esp32Plugin(Plugin):
         return result
 
     def act_reset(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "reset")
         b: Board = ctx.device
         seq = b.line_seq
-        ctx.log("pulsing EN (RTS)")
-        b.hard_reset()
+        if b.kind == PORT_UART_BRIDGE:
+            ctx.log("pulsing EN (RTS)")
+        else:
+            ctx.log(f"no RTS pin on a native port: resetting with esptool on {b.port}")
+        b.hard_reset(ctx)
         if p["wait_ready"]:
             return {"status": self._wait_ready_line(ctx, b, seq)}
         return {}
 
     def act_factory_reset(self, ctx: JobContext, p: dict):
+        hub = self._fake(ctx)
+        if hub:
+            hub.factory_reset()
+            ctx.log("fake hub: registry, history and rules erased")
+            return {"status": hub.status()}
         b: Board = ctx.device
         seq = b.line_seq
         reply = b.command(ctx, "factory-reset")
@@ -418,11 +776,16 @@ class Esp32Plugin(Plugin):
         if status.get("rules"):
             raise ActionFailed(f"board still has {status['rules']} rule(s) after reboot",
                                result={"status": status})
-        ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
-                f"provisioning ssid {status.get('ap_ssid')!r}")
+        if status.get("role") == "hub":
+            ctx.log(f"factory settings: {status.get('sensors')} sensor(s) known")
+        else:
+            ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
+                    f"provisioning ssid {status.get('ap_ssid')!r}")
         return {"status": status}
 
     def act_broadcast_ssid(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "broadcast-ssid")
+        self._sensor_only(ctx, "broadcast-ssid")
         b: Board = ctx.device
         cmd = "ap-start" if p["seconds"] is None else f"ap-start {p['seconds']}"
         status = b.command(ctx, cmd)
@@ -432,33 +795,80 @@ class Esp32Plugin(Plugin):
         ctx.log(f"broadcasting {status.get('ap_ssid')!r}")
         return {"ssid": status.get("ap_ssid"), "status": status}
 
+    def act_ble_advertise(self, ctx: JobContext, p: dict):
+        self._not_on_fake_hub(ctx, "ble-advertise")
+        self._sensor_only(ctx, "ble-advertise")
+        b: Board = ctx.device
+        cmd = "prov-start" if p["seconds"] is None else f"prov-start {p['seconds']}"
+        reply = b.request(ctx, cmd)
+        if not reply.ok:
+            msg = reply.payload.get("error") if isinstance(reply.payload, dict) else reply.payload
+            if msg == "unknown command":
+                raise ActionFailed("firmware too old for prov-start (flash a build with BLE "
+                                   "provisioning)", code="unsupported", result=reply.payload)
+            raise ActionFailed(f"device rejected {cmd!r}: {msg}", code="device_error",
+                               result=reply.payload)
+        status = reply.payload
+        if status.get("transport") == "softap":
+            raise ActionFailed("board runs a soft-AP build; use broadcast-ssid",
+                               code="wrong_transport", result={"status": status})
+        if not status.get("prov_on"):
+            raise ActionFailed("the board reports provisioning is off",
+                               result={"status": status})
+        ctx.log(f"advertising {status.get('ble_name')!r} over {status.get('transport')}")
+        return {"name": status.get("ble_name"), "transport": status.get("transport"),
+                "status": status}
+
     def act_expect(self, ctx: JobContext, p: dict):
         """Apply a block of changes. Nothing is cleared first: rules accumulate on
         the board until a later block overrides them, `-> normal` removes one, or
         `clear` drops them all."""
-        b: Board = ctx.device
         rules = [ln.strip() for ln in p["script"].splitlines()]
         rules = [ln for ln in rules if ln and not ln.startswith("#")]
         if not rules:
             raise ActionError("script has no rules", code="bad_request")
+        hub = self._fake(ctx)
         count = None
         for n, rule in enumerate(rules, 1):
-            reply = b.request(ctx, "rule " + rule)
+            if hub:
+                ctx.log(f"fake hub <- rule {rule}")
+                try:
+                    count = hub.add_rule(rule)
+                except ValueError as e:
+                    raise self._rule_rejected(n, rule, str(e)) from None
+                continue
+            reply = ctx.device.request(ctx, "rule " + rule)
             if not reply.ok:
                 msg = (reply.payload.get("error") if isinstance(reply.payload, dict)
                        else reply.payload)
-                raise ActionFailed(
-                    f"rule {n} rejected by the board: {msg}: {rule} "
-                    f"(lines 1-{n - 1} of this block were applied)" if n > 1 else
-                    f"rule {n} rejected by the board: {msg}: {rule}",
-                    code="rule_rejected",
-                    result={"line": n, "rule": rule, "error": msg, "applied": n - 1})
+                raise self._rule_rejected(n, rule, msg)
             if isinstance(reply.payload, dict):
                 count = reply.payload.get("rules", count)
         return {"rules": count, "applied": len(rules)}
 
     def act_clear(self, ctx: JobContext, p: dict):
+        hub = self._fake(ctx)
+        if hub:
+            hub.clear()
+            return {"rules": 0}
         return ctx.device.command(ctx, "clear")
+
+    def act_forget(self, ctx: JobContext, p: dict):
+        mac = p["mac"].strip().lower()
+        if not MAC_RE.match(mac):
+            raise ActionError(f"bad mac {p['mac']!r} (expected aa:bb:cc:dd:ee:ff)",
+                              code="bad_request")
+        hub = self._fake(ctx)
+        if hub:
+            if not hub.forget(mac):
+                raise ActionFailed(f"the hub doesn't know {mac}", code="device_error",
+                                   result={"mac": mac})
+            return {"forgotten": mac, "sensors": hub.status()["sensors"]}
+        b: Board = ctx.device
+        if b.role != "hub":
+            raise ActionError("forget is a hub action; use device=hub", code="wrong_role")
+        reply = b.command(ctx, f"forget {mac}")
+        return {"forgotten": mac, "reply": reply}
 
 
 def main() -> None:
@@ -466,14 +876,19 @@ def main() -> None:
     server = PluginServer(plugin, os.environ.get("PLUGIN_BIND", "0.0.0.0"),
                           _env_int("PLUGIN_PORT", 8091), os.environ.get("PLUGIN_TOKEN") or None)
     plugin.jobs = server.jobs
+    # systemd/launchd stop with SIGTERM: exit through `finally` so mDNS says goodbye.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"VisualTester-Esp32 {VERSION} (contract {ps.CONTRACT} v{ps.CONTRACT_VERSION}) "
-          f"on :{server.port}; ports {plugin.port_specs}", flush=True)
+          f"on :{server.port}; ports {plugin.port_specs}; fake hub {plugin.fake_hub_mode}",
+          flush=True)
     for b in plugin.boards():
         print(f"  board on {b.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        plugin.close()  # unregister the fake hub's mDNS name
 
 
 if __name__ == "__main__":
