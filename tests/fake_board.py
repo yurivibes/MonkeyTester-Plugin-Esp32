@@ -3,11 +3,18 @@
 FakeSerial looks enough like pyserial's Serial for board.Board; the firmware side
 answers the VT control protocol (TemperatureSensor docs/vt-control.md) and prints
 the `@vt - ready` line on boot.
+
+A USJ FakeSerial (kind `usb-serial-jtag`, or a ttyACM-style name) stands for a
+native USB-Serial-JTAG port: CDC-ACM, so DTR/RTS raise there and the only reset
+left is esptool's own; UsjNodes models the ttyACM index moving after that reset.
 """
 
 import json
+import os
 import threading
 import time
+
+from board import PORT_USB_SERIAL_JTAG, port_kind
 
 
 SENSOR_NO_HTTP = "no HTTP server; set rules on the hub"
@@ -195,16 +202,26 @@ class FakeFirmware:
 
 
 class FakeSerial:
-    def __init__(self, firmware: FakeFirmware, port="/dev/fake0"):
+    """Stands in for pyserial's Serial. `kind="usb-serial-jtag"` (or a ttyACM-style
+    port name) is CDC-ACM: no DTR/RTS ioctl, so no pin to pulse and no reset but
+    esptool's."""
+
+    def __init__(self, firmware: FakeFirmware, port="/dev/fake0", kind=None):
         self.fw = firmware
         self.port = port
+        self.kind = kind or port_kind(port)
+        self.usj = self.kind == PORT_USB_SERIAL_JTAG
         self._buf = bytearray()
         self._cond = threading.Condition()
         self._in = b""
         self.is_open = True
-        self._rts = False
-        self.dtr = False
+        self._dtr = self._rts = False
         firmware.port = self
+
+    def _no_pin(self, name):
+        # What pyserial raises for an ioctl the CDC-ACM interface doesn't have.
+        raise OSError(f"{self.port} is CDC-ACM: no {name} pin "
+                      "(reset it with esptool)")
 
     # firmware -> host
     def feed(self, data: bytes):
@@ -234,11 +251,23 @@ class FakeSerial:
         pass
 
     @property
+    def dtr(self):
+        return self._dtr
+
+    @dtr.setter
+    def dtr(self, v):
+        if self.usj:
+            raise self._no_pin("DTR")
+        self._dtr = v
+
+    @property
     def rts(self):
         return self._rts
 
     @rts.setter
     def rts(self, v):
+        if self.usj:
+            raise self._no_pin("RTS")
         if self._rts and not v:  # EN released: the chip boots
             self.fw.boot()
         self._rts = v
@@ -249,3 +278,24 @@ class FakeSerial:
             self._cond.notify_all()
         if self.fw.port is self:
             self.fw.port = None
+
+
+class UsjNodes:
+    """A fake `/dev/ttyACM*` enumeration for tests: esptool ends with its hard
+    reset, and the kernel re-creates the native interface with the next index
+    (`/dev/ttyACM0` -> `/dev/ttyACM1`). The fake esptool logs every run, so the
+    enumeration moves with the number of runs."""
+
+    def __init__(self, first="/dev/ttyACM0", log=None):
+        self.base = first.rstrip("0123456789")
+        self.first = int(first[len(self.base):] or 0)
+        self.log = log
+
+    def runs(self) -> int:
+        if not self.log or not os.path.isfile(self.log):
+            return 0
+        with open(self.log) as f:
+            return sum(1 for line in f if line.strip())
+
+    def ports(self) -> list:
+        return [f"{self.base}{self.first + self.runs()}"]

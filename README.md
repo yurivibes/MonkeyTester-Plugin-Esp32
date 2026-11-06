@@ -44,11 +44,15 @@ python3 -m venv .venv && .venv/bin/pip install pyserial esptool zeroconf
 
 Check it with `curl localhost:8091/health` and `curl localhost:8091/devices`.
 
-On Linux the user needs to be in the `dialout` group. Boards are found by
-globbing the usual USB-UART ports (`/dev/ttyUSB*`, `/dev/ttyACM*` on Linux;
+On Linux the user needs to be in the `dialout` group. Boards are found by globbing
+the usual USB ports (`/dev/serial/by-id/*`, `/dev/ttyUSB*`, `/dev/ttyACM*` on Linux;
 `/dev/cu.usbserial-*`, `/dev/cu.SLAB_USBtoUART*`, `/dev/cu.usbmodem*` on macOS)
-every 5 s; set `ESP32_PORTS` to pin them. Every environment variable is listed at
-the top of `esp32_plugin.py`.
+every 5 s; set `ESP32_PORTS` to pin them. A board is reached either through a
+CP2102N UART bridge (`/dev/ttyUSB*`) or over its own USB-Serial-JTAG interface
+(`/dev/ttyACM*`); `GET /devices` reports which in `details.port_kind`, together with
+the node it is on. The native interface identifies the board before it answers
+anything: its USB serial number is the board's MAC. Every environment variable is
+listed at the top of `esp32_plugin.py`.
 
 The fake hub needs `zeroconf` (in the flake's Python; `pip install zeroconf`
 otherwise) and its port reachable from the LAN (phones and sensors connect to
@@ -98,10 +102,12 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
 `factory-reset`, `ble-advertise`, `broadcast-ssid`, `expect`, `clear`,
 `forget`), roles and the fake hub. In short:
 
-- **Devices** are identified by MAC (learned from the firmware's `status`), and
+- **Devices** are identified by MAC — learned from the firmware's `status`, or read
+  off a native USB-Serial-JTAG port's USB serial number at discovery — and
   can also be addressed by serial port, or by role: `device=sensor` (the
   default; exactly one sensor must be attached) and `device=hub` (the hub board,
-  else the fake hub). One job runs per board at a time.
+  else the fake hub). One job runs per board at a time. A board whose node moved
+  (esptool's hard reset on a native port) keeps its MAC and moves with it.
 - **flash** takes a prebuilt ESP-IDF build directory: anything with a
   `flasher_args.json` in it or in its `build/` subdirectory, such as the
   `result/` of `nix build .#firmware-c3-debug-test` in TemperatureSensor. The
@@ -130,5 +136,5 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 | `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads. No ESP32 code. |
 | `esp32_plugin.py` | Board discovery, roles, actions, flashing, `main()` |
 | `fake_hub.py` | The fake hub: hub HTTP API, registry/history, hub rule language, mDNS |
-| `board.py` | One board on one serial port: reader thread, VT control requests, reset |
-| `tests/` | Contract and action tests with a fake board (`fake_board.py`: old sensor, sensor and hub firmware) and a fake esptool; `test_hub.py` covers roles and the fake hub |
+| `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, VT control requests, reset |
+| `tests/` | Contract and action tests with a fake board (`fake_board.py`: old sensor, sensor and hub firmware, and a fake USJ port whose node index moves after the fake esptool resets) and a fake esptool; `test_hub.py` covers roles and the fake hub |

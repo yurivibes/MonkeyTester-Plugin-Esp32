@@ -19,10 +19,31 @@ line says `"role":"sensor"` or `"role":"hub"`; firmware from before roles (no
 | `hub` | The attached `role: hub` board; when none is attached, the plugin's **fake hub** (see below), depending on `ESP32_FAKE_HUB` |
 | a MAC, or a serial port | That board. `tshub-fake` (or the fake hub's MAC `02:00:00:fa:4e:01`) is the fake hub |
 
-`GET /devices` lists every board with `details.role`, plus an entry with id
+`GET /devices` lists every board with `details.role`, `details.port` (the serial
+node it is on) and `details.port_kind` (how it is reached: `uart-bridge` through
+a CP2102N UART adapter, or `usb-serial-jtag` over the chip's own USB-Serial-JTAG
+interface), plus an entry with id
 `tshub-fake` (`details.fake: true`, `details.url`, `details.mdns`) while the fake
 hub is running. Sensor entries also carry the firmware's `hub`, `report` and
 `last_report` status fields; hub entries carry `sensors` and `time_synced`.
+
+## The two transports
+
+A board is reached over one of two serial transports (`board.py:port_kind`,
+reported as `details.port_kind`):
+
+| Port kind | Node | What it gives the plugin |
+|---|---|---|
+| `uart-bridge` | `/dev/ttyUSB*` (macOS `cu.usbserial*`): the CP2102N adapter | a baud rate (`ESP32_BAUD`, `ESP32_FLASH_BAUD`) and an EN/RTS pin to pulse |
+| `usb-serial-jtag` | `/dev/ttyACM*` (macOS `cu.usbmodem*`): the chip's own interface | nothing to set (CDC-ACM ignores the baud rate and has no DTR/RTS, so the plugin touches neither), no pin to reset through, and a USB serial number that **is the board's MAC** (`AC:27:6E:FA:BB:5C` in udev's by-id name) |
+
+A native board is therefore identified at discovery, before it answers VT
+control. It has no reset button on the wire: `reset` runs esptool on that port,
+which ends with its own hard reset. esptool may make the kernel re-create the
+interface with another index (`/dev/ttyACM0` becomes `/dev/ttyACM1`), so the
+plugin re-enumerates the nodes after every esptool run and the board follows its
+MAC to the new node — `details.port` changes, its id and events don't. The
+`baud` parameter and `ESP32_BAUD`/`ESP32_FLASH_BAUD` mean nothing there.
 
 ## The fake hub
 
@@ -60,8 +81,8 @@ Tests don't change between the fake and a real hub.
 
 | Action | Params | Passes when | Default timeout |
 |---|---|---|---|
-| `flash` | `firmware_dir` (path, required), `erase` (bool, false), `wait_ready` (bool, true), `baud` (int) | esptool succeeds and, with `wait_ready`, the board prints `@vt - ready` (or answers `status`) after reboot | 180 s |
-| `reset` | `wait_ready` (bool, true) | EN is pulsed and the board prints `@vt - ready`. A reboot drops every rule | 30 s |
+| `flash` | `firmware_dir` (path, required), `erase` (bool, false), `wait_ready` (bool, true), `baud` (int; ignored on a native port) | esptool succeeds and, with `wait_ready`, the board prints `@vt - ready` (or answers `status`) after reboot | 180 s |
+| `reset` | `wait_ready` (bool, true) | The board reboots — EN is pulsed through the adapter's RTS pin on a `uart-bridge` port, esptool's own hard reset on a native `usb-serial-jtag` one — and prints `@vt - ready`. A reboot drops every rule | 30 s |
 | `factory-reset` | — | The board forgets its provisioned Wi-Fi network, reboots, and comes back ready with no rules | 30 s |
 | `broadcast-ssid` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board reports its provisioning SSID (`BJF-<mac>`) is broadcasting; `result.ssid` is the name | 10 s |
 | `ble-advertise` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board answers `prov-start` and reports BLE provisioning is on; `result.name` is its BLE name (`BJF-<mac>`), `result.transport` is `ble`. Needs firmware with `prov-start` | 10 s |
@@ -197,6 +218,6 @@ sent.
 | `unsupported` | error | `flash`, `reset`, `ble-advertise` or `broadcast-ssid` on the fake hub |
 | `wrong_role` | error | `ble-advertise`/`broadcast-ssid` on a hub board, or `forget` on a sensor |
 | `bad_firmware` | error | `firmware_dir` has no usable `flasher_args.json` or images |
-| `flash_failed`, `tool_missing` | error | esptool failed or isn't installed |
+| `flash_failed`, `reset_failed`, `tool_missing` | error | esptool failed (flashing, or resetting a port that has no RTS pin) or isn't installed |
 | `port_closed`, `port_error` | error | The serial port went away |
 | `timeout` | timeout | The job's `timeout_ms` ran out |
