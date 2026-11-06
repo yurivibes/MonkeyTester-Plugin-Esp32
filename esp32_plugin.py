@@ -5,6 +5,13 @@ Owns the ESP32 boards attached to this host (Linux or macOS) and exposes them
 through the VisualTester Device Plugin API (PLUGIN_API.md in the VisualTester
 repo; generic part in plugin_server.py). Actions are listed in ACTIONS.md.
 
+Boards are reached over one of two transports (board.py:port_kind): the CP2102N
+UART bridge (`uart-bridge`, /dev/ttyUSB*) — a real baud rate and an EN/RTS pin —
+or the chip's own USB-Serial-JTAG interface (`usb-serial-jtag`, /dev/ttyACM*):
+CDC-ACM with no baud rate, no RTS pin (esptool resets it), and a USB serial
+number that is the board's MAC, which identifies it before it answers VT
+control. `GET /devices` reports `details.port_kind`.
+
 Environment:
   PLUGIN_BIND        listen address           (default 0.0.0.0)
   PLUGIN_PORT        listen port              (default 8091)
@@ -13,6 +20,8 @@ Environment:
                      (default: USB-UART ports for this OS, see DEFAULT_GLOBS)
   ESP32_BAUD         console baud rate        (default 115200)
   ESP32_FLASH_BAUD   esptool baud rate        (default 460800)
+                     (both are meaningless on a board's native USB-Serial-JTAG
+                     port — /dev/ttyACM*, CDC-ACM — where nothing is set)
   ESPTOOL            esptool command          (default: `esptool` on PATH, else
                      "<this python> -m esptool")
   ESP32_FIRMWARE_ROOT  relative firmware_dir values resolve against this
@@ -43,7 +52,7 @@ import threading
 import time
 
 import plugin_server as ps
-from board import Board
+from board import PORT_USB_SERIAL_JTAG, PORT_UART_BRIDGE, Board, port_kind
 from fake_hub import FAKE_HUB_ID, MAC_RE, FakeHub
 from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobContext,
                            Param, Plugin, PluginServer, Uploads)
@@ -59,6 +68,7 @@ RESCAN_S = 5.0
 READY_TIMEOUT_S = float(os.environ.get("ESP32_READY_TIMEOUT_S", "20"))
 FAKE_HUB_MODES = ("auto", "on", "off")
 IDENTIFY_WAIT_S = 3.0
+_MAC_IN_NAME = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 
 
 def _env_int(name, default):
@@ -66,6 +76,29 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except ValueError:
         return default
+
+
+def usb_mac(port: str) -> str | None:
+    """The MAC a serial node's USB metadata reports, if it reports one.
+
+    An ESP32's native USB-Serial-JTAG interface puts the board's MAC in its USB
+    serial number (uppercase colon form, e.g. `AC:27:6E:FA:BB:5C`), and udev puts
+    that serial number in the `/dev/serial/by-id/usb-…` name of the node — so the
+    board is identified at discovery, before it answers VT control. Other
+    interfaces (the CP2102N bridge: its own serial, `68a5…`) don't, and those
+    boards keep being identified by the firmware's `status` as before."""
+    real = os.path.realpath(port)
+    names = [os.path.basename(port), os.path.basename(real)]
+    if not names[1].startswith("usb-"):  # a plain node: look for its by-id link
+        for link in glob.glob("/dev/serial/by-id/*"):
+            if os.path.realpath(link) == real:
+                names.append(os.path.basename(link))
+                break
+    for name in names:
+        m = _MAC_IN_NAME.search(name)
+        if m and MAC_RE.match(m.group(0).lower()):
+            return m.group(0).lower()
+    return None
 
 
 # ───────────────────────────── flashing ─────────────────────────────
@@ -96,7 +129,8 @@ def esptool_command() -> list:
     return [sys.executable, "-m", "esptool"]
 
 
-def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bool) -> list:
+def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bool,
+                     kind: str | None = None) -> list:
     extra = args.get("extra_esptool_args") or {}
     files = args.get("flash_files") or {}
     if not files:
@@ -104,7 +138,11 @@ def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bo
     argv = esptool_command()
     if extra.get("stub") is False:
         argv.append("--no-stub")
-    argv += ["--port", port, "--baud", str(baud)]
+    argv += ["--port", port]
+    if kind != PORT_USB_SERIAL_JTAG:
+        # A native USB-Serial-JTAG port is CDC-ACM: there is no transfer baud
+        # rate there, and esptool takes --port (not --serial) in v5.x.
+        argv += ["--baud", str(baud)]
     if extra.get("chip"):
         argv += ["--chip", extra["chip"]]
     argv += ["--before", extra.get("before", "default_reset"),
@@ -119,6 +157,16 @@ def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bo
             raise ActionError(f"missing image {path}", code="bad_firmware")
         argv += [addr, path]
     return argv
+
+
+def esptool_reset_argv(port: str) -> list:
+    """A reset-only call for a board with no RTS pin (native USJ).
+
+    esptool has no `probe`/`info` command in v5.x and no reset command; an
+    identify command (`flash-id` reads the flash geometry, writes nothing) run
+    with the default `--after hard_reset` ends with esptool's own hard reset,
+    which is what resets the chip on that port."""
+    return esptool_command() + ["--port", port, "--after", "hard_reset", "flash-id"]
 
 
 def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
@@ -245,7 +293,17 @@ class Esp32Plugin(Plugin):
                     threading.Thread(target=self._identify, args=(known_board,),
                                      daemon=True).start()
                 continue
-            b = Board(port, self.baud, self.events, open_serial=self._open_serial)
+            moved = self._moved_board(port, ports)
+            if moved is not None:
+                # The kernel re-created the interface under a new index: same board,
+                # new node. Rebind it instead of registering the board twice.
+                self._rebind(moved, port)
+                self.events.publish(moved.id, "state",
+                                    {"state": "ready", "port": port,
+                                     "port_kind": moved.kind})
+                continue
+            b = Board(port, self.baud, self.events, open_serial=self._open_serial,
+                      mac=usb_mac(port), reset_tool=self._tool_hard_reset)
             try:
                 b.start()
             except Exception as e:  # noqa: BLE001 - busy/permission: report, retry later
@@ -261,11 +319,94 @@ class Esp32Plugin(Plugin):
             if b.mac:
                 b.id = b.mac
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
+                                                "port_kind": b.kind,
                                                 "vt_control": True, "role": b.role})
         else:
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
+                                                "port_kind": b.kind,
                                                 "vt_control": False})
         self.update_fake_hub()
+
+    # ── the device node can move (native USB-Serial-JTAG) ─────────
+
+    def _rebind(self, b: Board, port: str) -> None:
+        """Point the Board and the port map at a new node. The MAC is the board's
+        identity, so this is the same board: jobs, events and `device=` refs
+        follow it; `details.port` says which node it is on now."""
+        with self._lock:
+            self._boards.pop(b.port, None)
+            self._boards[port] = b
+        b.rebind(port)
+
+    def _moved_board(self, port: str, ports: list) -> Board | None:
+        """A Board whose MAC matches this node's USB metadata and whose own node
+        is gone: the kernel re-created the interface under a new index. Skipped
+        while a job owns the board (that job has the port)."""
+        mac = usb_mac(port)
+        if not mac:
+            return None
+        for b in self.boards():
+            if b.mac != mac or b.kind != port_kind(port):
+                continue
+            if self.jobs and self.jobs.is_busy(b.id):
+                continue
+            if any(os.path.realpath(p) == os.path.realpath(b.port) for p in ports):
+                continue
+            return b
+        return None
+
+    def _node_after_reset(self, b: Board) -> str | None:
+        """The node that took over `b`'s interface after esptool's hard reset
+        moved it (an index change on a native port), or None when the node is
+        still there or which node it is can't be told."""
+        ports = self._candidate_ports()
+        real = os.path.realpath(b.port)
+        if any(os.path.realpath(p) == real for p in ports):
+            return None
+        bound = {os.path.realpath(bb.port) for bb in self.boards() if bb is not b}
+        cands = [p for p in ports
+                 if os.path.realpath(p) not in bound and port_kind(p) == b.kind]
+        if b.mac:
+            exact = [p for p in cands if usb_mac(p) == b.mac]
+            if exact:
+                return exact[0]
+            if any(usb_mac(p) for p in cands):  # metadata says: other boards
+                return None
+        return cands[0] if len(cands) == 1 else None
+
+    def _reopen_after_tool(self, ctx: JobContext | None, b: Board) -> None:
+        """Reopen the port after esptool, which ends with its own hard reset."""
+        if b.kind != PORT_UART_BRIDGE:
+            new = self._node_after_reset(b)
+            if new:
+                self._rebind(b, new)
+                if ctx:
+                    ctx.log(f"the kernel re-created the interface as {new} "
+                            f"(still the board {b.id})")
+        b.resume()
+
+    def _tool_hard_reset(self, b: Board, ctx: JobContext | None) -> None:
+        """Reset a board whose port has no RTS pin (native USJ): esptool on that
+        same port, which ends with esptool's own hard reset. esptool has no
+        `probe`/`info` command in v5.x; an identify command writes nothing, and
+        ESP32-C3 has no chip id (esptool falls back to the MAC) — not a failure.
+        After it the node may have moved, so the Board rebinds before resuming."""
+        argv = esptool_reset_argv(b.port)
+        b.pause()
+        try:
+            if ctx is None:  # outside a job: no transcript to pump into
+                proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True,
+                                      errors="replace")
+                rc, out = proc.returncode, proc.stdout
+            else:
+                rc, out = run_tool(ctx, argv)
+        finally:
+            self._reopen_after_tool(ctx, b)
+        if rc != 0:
+            tail = "\n".join(out.splitlines()[-5:])
+            raise ActionError(f"esptool reset exited {rc} on {b.port}: {tail}",
+                              code="reset_failed")
 
     # ── the fake hub ──────────────────────────────────────────
 
@@ -554,7 +695,8 @@ class Esp32Plugin(Plugin):
         self._not_on_fake_hub(ctx, "flash")
         b: Board = ctx.device
         build_dir, args = find_flasher_args(p["firmware_dir"])
-        argv = build_flash_argv(b.port, build_dir, args, p["baud"] or self.flash_baud, p["erase"])
+        argv = build_flash_argv(b.port, build_dir, args,
+                                p["baud"] or self.flash_baud, p["erase"], b.kind)
         ctx.log(f"flashing {build_dir} -> {b.port}")
         b.pause()
         try:
@@ -562,7 +704,7 @@ class Esp32Plugin(Plugin):
         finally:
             seq = b.line_seq
             try:
-                b.resume()
+                self._reopen_after_tool(ctx, b)
             except Exception as e:  # noqa: BLE001
                 raise ActionError(f"couldn't reopen {b.port} after flashing: {e}",
                                   code="port_error") from None
@@ -582,8 +724,11 @@ class Esp32Plugin(Plugin):
         self._not_on_fake_hub(ctx, "reset")
         b: Board = ctx.device
         seq = b.line_seq
-        ctx.log("pulsing EN (RTS)")
-        b.hard_reset()
+        if b.kind == PORT_UART_BRIDGE:
+            ctx.log("pulsing EN (RTS)")
+        else:
+            ctx.log(f"no RTS pin on a native port: resetting with esptool on {b.port}")
+        b.hard_reset(ctx)
         if p["wait_ready"]:
             return {"status": self._wait_ready_line(ctx, b, seq)}
         return {}
