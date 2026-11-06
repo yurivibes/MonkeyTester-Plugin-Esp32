@@ -286,10 +286,15 @@ class UsjNodes:
     (`/dev/ttyACM0` -> `/dev/ttyACM1`). The fake esptool logs every run, so the
     enumeration moves with the number of runs."""
 
-    def __init__(self, first="/dev/ttyACM0", log=None):
+    def __init__(self, first="/dev/ttyACM0", log=None, gap=0):
         self.base = first.rstrip("0123456789")
         self.first = int(first[len(self.base):] or 0)
         self.log = log
+        # After each esptool run the node is missing for `gap` enumerations, the
+        # way a real chip drops off the bus for a moment after its reset.
+        self.gap = gap
+        self._seen_runs = 0
+        self._missing = 0
 
     def runs(self) -> int:
         if not self.log or not os.path.isfile(self.log):
@@ -298,4 +303,11 @@ class UsjNodes:
             return sum(1 for line in f if line.strip())
 
     def ports(self) -> list:
-        return [f"{self.base}{self.first + self.runs()}"]
+        runs = self.runs()
+        if runs != self._seen_runs:
+            self._seen_runs = runs
+            self._missing = self.gap
+        if self._missing > 0:
+            self._missing -= 1
+            return []
+        return [f"{self.base}{self.first + runs}"]
