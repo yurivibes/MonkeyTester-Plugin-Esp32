@@ -32,6 +32,20 @@ Device Plugin API. See README.md.
 - **No test logic.** The plugin doesn't know about apps or vision models; it only
   makes boards do things and reports whether they did.
 - Keep ACTIONS.md in step with `_build_actions()`.
+- **Keep the user informed of user-relevant changes.** A change is user-relevant
+  when it changes what a person running the plugin by hand does or sees: how to
+  install, start, stop or restart it (systemd unit, LaunchAgent, `nix run`),
+  ports (8091, fake hub 8092, mDNS), environment variables, board discovery and
+  serial-port handling (e.g. it holding the ports open), the curl/HTTP commands
+  in README.md, test step syntax (`PLUGIN: esp32 …`), or required
+  packages/groups (`dialout`). For every such change:
+  - update README.md (and ACTIONS.md for actions) **in the same PR**; the README
+    commands must work as written;
+  - add a **"For the user"** section to the PR description saying in plain
+    words what changed for them and what, if anything, they must do (e.g.
+    restart the service, update the unit file);
+  - call it out in the report to the user, not only in the PR.
+  If a change is not user-relevant, say "For the user: no change" in the PR.
 - Work in a git worktree on a feature branch and open a PR; never commit to master.
 
 ## Tests
