@@ -72,6 +72,59 @@ To keep it running: `packaging/systemd/visualtester-esp32.service` (Linux, user
 unit) or `packaging/launchd/com.blackjackfruit.visualtester-esp32.plist` (macOS
 LaunchAgent).
 
+### Start and stop
+
+While it runs, the plugin keeps every board's serial port open. **Stop it before
+you flash a board or open a serial monitor yourself** (`nix run .#monitor`,
+esptool, screen, …), and start it again when you are done, or CI runs cannot
+reach the boards.
+
+**Linux (systemd user service):**
+
+```bash
+# Install once
+cp packaging/systemd/visualtester-esp32.service ~/.config/systemd/user/
+#   (edit WorkingDirectory if the checkout is not ~/Workspace/VisualTester-Esp32)
+systemctl --user daemon-reload
+systemctl --user enable --now visualtester-esp32   # start now and at login
+
+# Day to day
+systemctl --user stop visualtester-esp32      # frees the serial ports
+systemctl --user start visualtester-esp32
+systemctl --user restart visualtester-esp32   # e.g. after pulling a new version
+systemctl --user status visualtester-esp32
+journalctl --user -u visualtester-esp32 -f    # live log
+```
+
+If the user manager's `PATH` has no `nix`, spell it out in `ExecStart` (e.g.
+`~/.nix-profile/bin/nix --extra-experimental-features "nix-command flakes" run .`).
+
+**macOS (LaunchAgent):** replace `PYTHON` and `CHECKOUT_DIR` in the plist, then
+
+```bash
+cp packaging/launchd/com.blackjackfruit.visualtester-esp32.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.blackjackfruit.visualtester-esp32.plist    # start
+launchctl unload -w ~/Library/LaunchAgents/com.blackjackfruit.visualtester-esp32.plist  # stop
+tail -f /tmp/visualtester-esp32.log
+```
+
+**In the foreground:** `nix run` (or `.venv/bin/python esp32_plugin.py`); stop it
+with Ctrl-C. Only one copy can run at a time: stop the service first.
+
+To see which port each board is on (useful before flashing by hand):
+
+```bash
+curl -s localhost:8091/devices   # details.role (sensor/hub), details.port, details.mac
+```
+
+Without stopping the plugin you can still make the sensor advertise over BLE
+through the plugin's own API (`seconds: 0` = until provisioned or a reboot):
+
+```bash
+curl -s -XPOST localhost:8091/jobs -H 'Content-Type: application/json' \
+  -d '{"device":"sensor","action":"ble-advertise","params":{"seconds":0},"timeout_ms":60000}'
+```
+
 ### Pointing VisualTester at it
 
 ```bash
