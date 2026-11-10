@@ -334,8 +334,11 @@ class Board:
     def role(self) -> str:
         """`sensor` or `hub`, from the firmware's status. Firmware from before
         roles (no `role` field) and boards that don't answer VT control count
-        as sensors."""
+        as sensors. `server` (the project's rename of "hub") is a status alias
+        that normalizes to `hub`, which stays the wire value."""
         role = (self.status or {}).get("role")
+        if role == "server":
+            return "hub"
         return role if role in ("sensor", "hub") else "sensor"
 
     def to_json(self, busy: bool) -> dict:
