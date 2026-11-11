@@ -5,7 +5,7 @@ stream into lines, publishes every line as a `serial` event, and routes
 `@vt <id> ok|err ...` replies to whoever sent the request. Flashing pauses the
 reader so esptool can have the port.
 
-The protocol itself is specified in the firmware repo (TemperatureSensor,
+The protocol itself is specified in the firmware repo (Esp32-Sensor,
 docs/vt-control.md).
 
 A board is reached over one of two transports (`port_kind`, see ACTIONS.md): the
