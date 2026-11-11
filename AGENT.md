@@ -13,8 +13,8 @@ software server are the sibling plugin's (VisualTester-Esp32-Server, `esp32-serv
   job states or fields here without changing that document first (and bumping
   `contract_version` for breaking changes).
 - **The device protocol is owned by the firmware.** Board commands and the rule
-  language follow `docs/vt-control.md` in TemperatureSensor and
-  `docs/hub-protocol.md` in TemperatureSensor-Hub (roles, hub API, sections 6-7).
+  language follow `docs/vt-control.md` in Esp32-Sensor and
+  `docs/hub-protocol.md` in Esp32-Server (roles, hub API, sections 6-7).
   For boards, `expect` relays rule lines without interpreting them; don't add
   parsing or validation of board rules here.
 - **Sensor boards only.** A node whose firmware `status` answers `role: hub` is
