@@ -86,9 +86,6 @@ OWNED_BOARD_ROLES = ("sensor",)
 OTHER_BOARD_ROLES = ("hub", "server")
 LOCK_DIR_DEFAULT = "/tmp/vt-esp32-locks"
 ROLE_CACHE_DEFAULT = "/tmp/vt-esp32-roles.json"
-# flock(2) try-lock on Linux (FLOCK_TRY_LOCK|FLOCK_NB); 3 is the plain
-# busy-check flock (FLOCK_BUSY_LOCK), which is what glibc's flock() uses.
-_FLOCK_CMDS = (3, (1 << 5) | 1)
 
 
 def _env_int(name, default):
@@ -117,14 +114,14 @@ def try_lock_port(lock_dir: str, port: str):
                      os.O_RDWR | os.O_CREAT)
     except OSError:
         return False
-    for cmd in _FLOCK_CMDS:
-        try:
-            fcntl.flock(fd, cmd)
-            return fd
-        except OSError as e:
-            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return None  # the other plugin owns this console
-    return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # exclusive, non-blocking
+        return fd
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None  # the other plugin owns this console
+        return False
 
 
 def cache_read(path: str) -> dict:
