@@ -17,7 +17,7 @@ plugin processes never open the same serial console.
 VisualTester reaches it only through the shared **Device Plugin API**
 (`PLUGIN_API.md` in the VisualTester repo). Boards are driven over their serial
 console with the **VT control protocol** (`docs/vt-control.md` in
-[TemperatureSensor](http://192.168.125.70:3000/blackjackfruit/TemperatureSensor)),
+[Esp32-Sensor](http://192.168.125.70:3000/blackjackfruit/Esp32-Sensor)),
 which that firmware's `…-test` builds include.
 
 ```
@@ -28,7 +28,7 @@ VisualTester ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or ma
 ```
 
 A board's **role** (`sensor` or `hub`, from its firmware's status; see
-`docs/hub-protocol.md` in TemperatureSensor-Hub) decides which plugin owns it.
+`docs/hub-protocol.md` in Esp32-Server) decides which plugin owns it.
 Here, `device=sensor` (the default) or `device=<mac>`; `device=hub`/`server` is
 answered with `wrong_plugin` — run the step against the esp32-server plugin
 instead. When this plugin finds a hub board it drops it and releases its
@@ -160,7 +160,7 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
   moved (esptool's hard reset on a native port) keeps its MAC and moves with it.
 - **flash** takes a prebuilt ESP-IDF build directory: anything with a
   `flasher_args.json` in it or in its `build/` subdirectory, such as the
-  `result/` of `nix build .#firmware-c3-debug-test` in TemperatureSensor. The
+  `result/` of `nix build .#firmware-c3-debug-test` in Esp32-Sensor. The
   directory is a path on the plugin's host; when VisualTester runs elsewhere it
   can `POST /uploads` a zip of it and pass `upload:<id>` instead.
 - **expect** is a relay: the test's inline block goes to the board line by line

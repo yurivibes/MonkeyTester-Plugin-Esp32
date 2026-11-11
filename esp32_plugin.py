@@ -697,7 +697,7 @@ class Esp32Plugin(Plugin):
                    "Apply changes to how the device answers the app: each line of `script` is "
                    "sent as a rule, on top of the rules already loaded (state only what "
                    "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
-                   "The rule language is the firmware's (TemperatureSensor "
+                   "The rule language is the firmware's (Esp32-Sensor "
                    "docs/vt-control.md, hub-protocol.md section 6): HTTP rules go to "
                    "the esp32-server plugin (device=hub there), `report`/`temp`/`wifi` "
                    "directives to the sensor. Blank and # lines are skipped. Stops at the "
