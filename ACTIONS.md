@@ -6,7 +6,7 @@ parameter schemas.
 
 ## Devices and roles
 
-This plugin owns the **`role: sensor`** boards only (TemperatureSensor-Hub
+This plugin owns the **`role: sensor`** boards only (Esp32-Server
 `docs/hub-protocol.md` sections 6 and 7 name the roles; the project calls the
 `role: hub` boards "server"). Each board's `status` / `@vt - ready` line says
 `"role":"sensor"` or `"role":"hub"`; firmware from before roles (no `role`
@@ -128,7 +128,7 @@ END
 
 For a board, the plugin doesn't interpret the rules. It drops blank and `#`
 lines and sends each line as `rule <line>` over the VT control protocol, nothing
-else. The rule language belongs to the firmware: `docs/vt-control.md` in TemperatureSensor
+else. The rule language belongs to the firmware: `docs/vt-control.md` in Esp32-Sensor
 (HTTP responses with a status and body, `hang`, `delay`, `sequence` for a
 reading whose temperature moves on with each request, `normal` to undo one
 rule, and `wifi`/`mqtt` directives). A later rule for the same method and path
