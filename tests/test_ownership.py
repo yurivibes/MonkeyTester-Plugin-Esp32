@@ -10,6 +10,7 @@ Run: python3 -m unittest discover -s tests   (needs pyserial)
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -113,6 +114,31 @@ class OwnershipTests(unittest.TestCase):
         finally:
             esp32_plugin.try_lock_port = orig_try
             Esp32Plugin._drop_lock = orig_drop
+
+
+class RealFlockTests(unittest.TestCase):
+    """The console lock against a second, real process (not simulated): the
+    sibling plugin must not get a node this process holds, and gets it once
+    released. Guards against a lock call that silently does nothing."""
+
+    def other_process_try(self, lock_dir, port):
+        code = ("import sys; sys.path.insert(0, %r); import esp32_plugin as p; "
+                "r = p.try_lock_port(%r, %r); print('none' if r is None else 'got')"
+                % (os.path.dirname(HERE), lock_dir, port))
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout.strip()
+
+    def test_a_held_node_is_refused_to_another_process(self):
+        lock_dir = tempfile.mkdtemp()
+        fd = esp32_plugin.try_lock_port(lock_dir, "/dev/null")
+        self.assertNotIn(fd, (None, False))
+        try:
+            self.assertEqual(self.other_process_try(lock_dir, "/dev/null"), "none")
+        finally:
+            os.close(fd)
+        self.assertEqual(self.other_process_try(lock_dir, "/dev/null"), "got")
 
 
 if __name__ == "__main__":
