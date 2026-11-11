@@ -1,9 +1,11 @@
-# VisualTester-Esp32 — Agent Guide
+# VisualTester-Esp32-Sensor — Agent Guide
 
 ## Purpose
-The `esp32` device plugin for VisualTester: flashes prebuilt firmware onto ESP32
-boards and drives them over the VT control serial protocol, behind the shared
-Device Plugin API. See README.md.
+The `esp32-sensor` device plugin for VisualTester: flashes prebuilt firmware
+onto the **sensor** ESP32 boards and drives them over the VT control serial
+protocol, behind the shared Device Plugin API. Hub/server boards and the fake
+software server are the sibling plugin's (VisualTester-Esp32-Server, `esp32-server`,
+:8093). See README.md.
 
 ## Critical Rules
 - **The plugin API is a contract.** `plugin_server.py` implements
@@ -15,10 +17,13 @@ Device Plugin API. See README.md.
   `docs/hub-protocol.md` in TemperatureSensor-Hub (roles, hub API, sections 6-7).
   For boards, `expect` relays rule lines without interpreting them; don't add
   parsing or validation of board rules here.
-- **The fake hub is the one exception:** `fake_hub.py` implements hub-protocol.md
-  sections 1-4 and the hub rule language itself. Change it only together with
-  that spec, and keep it behaving like the hub firmware (tests must not change
-  between the fake and a real hub).
+- **Sensor boards only.** A node whose firmware `status` answers `role: hub` is
+  probed, dropped and its console lock released so esp32-server adopts it; the
+  shared role cache keeps the next scan from touching it again. Hub actions
+  (`forget`) and the fake server live in the other repo — don't move them back.
+  The lock dir and role cache defaults (`/tmp/vt-esp32-locks`,
+  `/tmp/vt-esp32-roles.json`) must match esp32-server's exactly: they are the
+  cross-process protocol.
 - **Two transports, one protocol.** A board is either on a CP2102N UART bridge
   (`uart-bridge`, `/dev/ttyUSB*`) or on its own USB-Serial-JTAG interface
   (`usb-serial-jtag`, `/dev/ttyACM*`). On the native one the plugin never sets a
@@ -27,18 +32,18 @@ Device Plugin API. See README.md.
   hands the interface a new node index. `board.py:port_kind` is the one helper
   that decides; ACTIONS.md documents it.
 - **Must run on Linux and macOS.** No Linux-only paths or tools in code paths
-  (port globs are per-OS in `DEFAULT_GLOBS`). Python stdlib + pyserial + esptool,
-  plus zeroconf for the fake hub's mDNS (imported lazily; tests mock it).
+  (port globs are per-OS in `DEFAULT_GLOBS`). Python stdlib + pyserial + esptool
+  only — no zeroconf here (mDNS belongs to the fake server in the other repo).
 - **No test logic.** The plugin doesn't know about apps or vision models; it only
   makes boards do things and reports whether they did.
 - Keep ACTIONS.md in step with `_build_actions()`.
 - **Keep the user informed of user-relevant changes.** A change is user-relevant
   when it changes what a person running the plugin by hand does or sees: how to
   install, start, stop or restart it (systemd unit, LaunchAgent, `nix run`),
-  ports (8091, fake hub 8092, mDNS), environment variables, board discovery and
-  serial-port handling (e.g. it holding the ports open), the curl/HTTP commands
-  in README.md, test step syntax (`PLUGIN: esp32 …`), or required
-  packages/groups (`dialout`). For every such change:
+  ports (8091 here), environment variables, board discovery and serial-port
+  handling (e.g. it holding the ports open), the curl/HTTP commands in README.md,
+  test step syntax (`PLUGIN: esp32-sensor …`), or required packages/groups
+  (`dialout`). For every such change:
   - update README.md (and ACTIONS.md for actions) **in the same PR**; the README
     commands must work as written;
   - add a **"For the user"** section to the PR description saying in plain
@@ -46,7 +51,8 @@ Device Plugin API. See README.md.
     restart the service, update the unit file);
   - call it out in the report to the user, not only in the PR.
   If a change is not user-relevant, say "For the user: no change" in the PR.
-- Work in a git worktree on a feature branch and open a PR; never commit to master.
+- Work in a git worktree on a feature branch and open a PR; never commit to
+  master.
 
 ## Tests
 `nix run .#tests` (or `python3 -m unittest discover -s tests` with pyserial
@@ -57,7 +63,6 @@ after every fake-esptool run, so the native port's reset, rebind and reopening o
 the port are tested without hardware. Only real-hardware specifics (esptool
 against a chip, an RTS reset on the bridge) need a board attached. The fakes never
 open a real port: tests pin `ESP32_PORTS`/`_candidate_ports` to fake nodes.
-The fake hub tests bind 127.0.0.1 on random ports and never touch real mDNS. To try
-the fake hub by hand, run a scratch plugin on other ports with no boards
-(`ESP32_PORTS=/dev/none PLUGIN_PORT=8191 ESP32_FAKE_HUB_PORT=8192`); it does
-advertise `tshub-fake` on the LAN while it runs.
+`test_ownership.py` covers the split: a hub-role node gets probed, dropped, its
+lock freed and its role cached (the flock primitives are simulated there — one
+process stands in for two).

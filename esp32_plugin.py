@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""VisualTester-Esp32: the `esp32` device plugin for VisualTester.
+"""VisualTester-Esp32-Sensor: the `esp32-sensor` device plugin for VisualTester.
 
-Owns the ESP32 boards attached to this host (Linux or macOS) and exposes them
-through the VisualTester Device Plugin API (PLUGIN_API.md in the VisualTester
-repo; generic part in plugin_server.py). Actions are listed in ACTIONS.md.
+Owns the `role: sensor` ESP32 boards plugged into this host (Linux or macOS)
+and exposes them through the VisualTester Device Plugin API (PLUGIN_API.md in
+the VisualTester repo; generic part in plugin_server.py); actions are listed
+in ACTIONS.md. The `role: hub` boards (the project's "server" boards) belong to
+the sibling esp32-server plugin (VisualTester-Esp32-Server), never to this one:
+a node that answers `status` with the other role is probed, dropped and its
+console lock released, so the other plugin adopts it; the shared role cache
+lets this plugin skip such a node without touching it again.
 
 Boards are reached over one of two transports (board.py:port_kind): the CP2102N
 UART bridge (`uart-bridge`, /dev/ttyUSB*) — a real baud rate and an EN/RTS pin —
@@ -26,19 +31,19 @@ Environment:
                      "<this python> -m esptool")
   ESP32_FIRMWARE_ROOT  relative firmware_dir values resolve against this
                      (default: the current directory)
-  ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after a reset (default 20)
+  ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after boot (default 20)
   PLUGIN_UPLOAD_DIR  where POST /uploads unpacks zips (default: <tmp>/vt-plugin-uploads)
-  ESP32_FAKE_HUB     auto | on | off: when `device=hub` uses the software fake hub
-                     (default auto: only while no `role: hub` board is attached)
-  ESP32_FAKE_HUB_PORT  fake hub HTTP port   (default 8092)
-  ESP32_FAKE_HUB_BIND  fake hub listen address (default 0.0.0.0)
-  ESP32_FAKE_HUB_ADDR  IPv4 the fake hub advertises over mDNS and reports as its
-                     `ip` (default: the address of the default-route interface)
+  ESP32_LOCK_DIR     per-node lock files shared with the esp32-server plugin
+                     (default /tmp/vt-esp32-locks)
+  ESP32_ROLE_CACHE   JSON file {board key -> role} shared with the esp32-server
+                     plugin (default /tmp/vt-esp32-roles.json)
 """
 
 from __future__ import annotations
 
 import glob
+import errno
+import fcntl
 import json
 import os
 import platform
@@ -53,7 +58,6 @@ import time
 
 import plugin_server as ps
 from board import PORT_USB_SERIAL_JTAG, PORT_UART_BRIDGE, Board, port_kind
-from fake_hub import FAKE_HUB_ID, MAC_RE, FakeHub
 from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobContext,
                            Param, Plugin, PluginServer, Uploads)
 
@@ -66,11 +70,22 @@ DEFAULT_GLOBS = {
 }
 RESCAN_S = 5.0
 READY_TIMEOUT_S = float(os.environ.get("ESP32_READY_TIMEOUT_S", "20"))
-FAKE_HUB_MODES = ("auto", "on", "off")
 IDENTIFY_WAIT_S = 3.0
 # A native USB-Serial-JTAG node vanishes and comes back after a chip reset.
 USJ_REAPPEAR_S = float(os.environ.get("ESP32_USJ_REAPPEAR_S", "10"))
 _MAC_IN_NAME = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+PLUGIN_NAME = "esp32-sensor"
+PLUGIN_DEFAULT_PORT = 8091
+# The board roles this plugin owns. The project calls the hub board "server";
+# the firmware's status field still says `hub`, which stays the wire value and
+# `server` is only a `device=` alias. Those boards belong to the sibling
+# esp32-server plugin, never to this one.
+OWNED_BOARD_ROLES = ("sensor",)
+OTHER_BOARD_ROLES = ("hub", "server")
+LOCK_DIR_DEFAULT = "/tmp/vt-esp32-locks"
+ROLE_CACHE_DEFAULT = "/tmp/vt-esp32-roles.json"
 
 
 def _env_int(name, default):
@@ -78,6 +93,56 @@ def _env_int(name, default):
         return int(os.environ.get(name, default))
     except ValueError:
         return default
+
+
+def _lock_name(port: str) -> str:
+    """Lock file for a serial node, named after its real device path."""
+    return re.sub(r"[^A-Za-z0-9_.+-]", "-", os.path.realpath(port))
+
+
+def try_lock_port(lock_dir: str, port: str):
+    """Try to take the shared lock for `port`.
+
+    fd (locked by this process; the OS drops it if the process exits),
+    None (the other plugin holds it, skip this node until the next rescan)
+    or False (locking unavailable — e.g. a fake port: assume this host
+    is the only plugin and keep the pre-split behaviour).
+    """
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+        fd = os.open(os.path.join(lock_dir, _lock_name(port)),
+                     os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # exclusive, non-blocking
+        return fd
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None  # the other plugin owns this console
+        return False
+
+
+def cache_read(path: str) -> dict:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def cache_write(path: str, key: str, value: str) -> None:
+    try:
+        data = cache_read(path)
+        data[key] = value
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def usb_mac(port: str) -> str | None:
@@ -208,14 +273,15 @@ def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
 
 
 class Esp32Plugin(Plugin):
-    name = "esp32"
+    """The `esp32-sensor` plugin: owns the `role: sensor` boards. The `role:
+    hub` boards ("server" boards) belong to the sibling esp32-server plugin."""
+    name = PLUGIN_NAME
     version = VERSION
     capabilities = ["events", "uploads"]
 
     def __init__(self, ports=None, baud=None, flash_baud=None,
                  open_serial=None, firmware_root=None, rescan=True,
-                 fake_hub_mode=None, fake_hub_port=None, fake_hub_bind=None,
-                 fake_hub_address=None, mdns_advertiser=None, log=None):
+                 lock_dir=None, role_cache=None):
         super().__init__()
         if os.environ.get("PLUGIN_UPLOAD_DIR"):
             self.uploads = Uploads(os.environ["PLUGIN_UPLOAD_DIR"])
@@ -228,25 +294,20 @@ class Esp32Plugin(Plugin):
         self._lock = threading.Lock()
         self._error = None
         self.jobs = None  # set by main() / tests, to report `busy`
-        mode = (fake_hub_mode or os.environ.get("ESP32_FAKE_HUB") or "auto").strip().lower()
-        if mode not in FAKE_HUB_MODES:
-            raise ValueError(f"ESP32_FAKE_HUB must be auto, on or off (got {mode!r})")
-        self.fake_hub_mode = mode
-        self._fake_lock = threading.Lock()
-        self.fake_hub: FakeHub | None = None
-        if mode != "off":
-            self.fake_hub = FakeHub(
-                port=fake_hub_port if fake_hub_port is not None
-                else _env_int("ESP32_FAKE_HUB_PORT", 8092),
-                bind=fake_hub_bind or os.environ.get("ESP32_FAKE_HUB_BIND") or "0.0.0.0",
-                address=fake_hub_address or os.environ.get("ESP32_FAKE_HUB_ADDR") or None,
-                fw=VERSION, advertiser_factory=mdns_advertiser,
-                log=log or (lambda m: print(m, flush=True)))
+        # Cross-process board ownership: the esp32-server plugin must never
+        # open this plugin's boards' consoles (two reader threads on one tty
+        # shred each other's bytes). A per-node flock says which plugin has a
+        # console; the role cache lets either plugin skip a node whose role
+        # already belongs to the other one. A plugin that finds a board of
+        # the other role drops it and hands its lock over on the next rescan.
+        self.lock_dir = lock_dir if lock_dir is not None else (
+            os.environ.get("ESP32_LOCK_DIR") or LOCK_DIR_DEFAULT)
+        self.role_cache = role_cache if role_cache is not None else (
+            os.environ.get("ESP32_ROLE_CACHE") or ROLE_CACHE_DEFAULT)
+        self._port_locks: dict[str, int] = {}  # port -> open lock fd
+        self._cache_lock = threading.Lock()
         self._actions = self._build_actions()
-        self._scanned = False  # no fake-hub decision before the first scan found every board
         self.rescan()
-        self._scanned = True
-        self.update_fake_hub()
         if rescan:
             threading.Thread(target=self._rescan_loop, daemon=True).start()
 
@@ -280,9 +341,22 @@ class Esp32Plugin(Plugin):
         for port, b in known.items():
             if not b.online and not b._paused.is_set():
                 b.stop()
+                self._drop_lock(port)
                 with self._lock:
                     self._boards.pop(port, None)
                 self.events.publish(b.id, "state", {"state": "removed", "port": port})
+        # Keep cached roles current for the boards we own: a board reflashed
+        # with the other role's firmware must be handed over, not hoarded.
+        for b in list(self.boards()):
+            if b.online and not b._paused.is_set():
+                self._cache_role(b)
+                if b.vt and not self._owns(b.role):
+                    # It answers status and says the other role: the firmware
+                    # changed under us. Drop it; the other plugin adopts it.
+                    b.stop()
+                    self._drop_lock(b.port)
+                    with self._lock:
+                        self._boards.pop(b.port, None)
         for port in ports:
             with self._lock:
                 known_board = self._boards.get(port)
@@ -295,11 +369,20 @@ class Esp32Plugin(Plugin):
                     threading.Thread(target=self._identify, args=(known_board,),
                                      daemon=True).start()
                 continue
+            cached = self._cached_role(port)
+            if cached and not self._owns(cached):
+                continue
+            fd = try_lock_port(self.lock_dir, port) if self.lock_dir else False
+            if fd is None:  # the other plugin has this console; retry next scan
+                continue
+            if fd is not False:
+                with self._lock:
+                    self._port_locks[port] = fd
             moved = self._moved_board(port, ports)
             if moved is not None:
                 # The kernel re-created the interface under a new index: same board,
                 # new node. Rebind it instead of registering the board twice.
-                self._rebind(moved, port)
+                self._rebind(moved, port, fd)
                 self.events.publish(moved.id, "state",
                                     {"state": "ready", "port": port,
                                      "port_kind": moved.kind})
@@ -310,6 +393,7 @@ class Esp32Plugin(Plugin):
                 b.start()
             except Exception as e:  # noqa: BLE001 - busy/permission: report, retry later
                 self._error = f"{port}: {e}"
+                self._drop_lock(port)
                 continue
             with self._lock:
                 self._boards[port] = b
@@ -317,27 +401,43 @@ class Esp32Plugin(Plugin):
         self._error = None if ports or not self.port_specs else self._error
 
     def _identify(self, b: Board) -> None:
+        owned = False
         if b.probe():
-            if b.mac:
-                b.id = b.mac
-            self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
-                                                "port_kind": b.kind,
-                                                "vt_control": True, "role": b.role})
+            self._cache_role(b)
+            owned = self._owns(b.role)
         else:
+            owned = True  # a board that never answers VT control counts as a sensor
+        if not owned:
+            # Not our board: give the console back; esp32-server adopts it
+            # on its next rescan.
+            b.stop()
+            self._drop_lock(b.port)
+            with self._lock:
+                self._boards.pop(b.port, None)
+            return
+        if b.mac:
+            b.id = b.mac
+        if b.vt is not None and not b.vt:
             self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
                                                 "port_kind": b.kind,
                                                 "vt_control": False})
-        self.update_fake_hub()
+        else:
+            self.events.publish(b.id, "state", {"state": "ready", "port": b.port,
+                                                "port_kind": b.kind,
+                                                "vt_control": True, "role": b.role})
 
     # ── the device node can move (native USB-Serial-JTAG) ─────────
 
-    def _rebind(self, b: Board, port: str) -> None:
+    def _rebind(self, b: Board, port: str, fd=None) -> None:
         """Point the Board and the port map at a new node. The MAC is the board's
         identity, so this is the same board: jobs, events and `device=` refs
         follow it; `details.port` says which node it is on now."""
         with self._lock:
             self._boards.pop(b.port, None)
             self._boards[port] = b
+        self._drop_lock(b.port)  # release the old node's lock
+        if fd is not False:
+            self._port_locks[port] = fd
         b.rebind(port)
 
     def _moved_board(self, port: str, ports: list) -> Board | None:
@@ -356,6 +456,38 @@ class Esp32Plugin(Plugin):
                 continue
             return b
         return None
+
+    # ── cross-process board ownership (shared with esp32-server) ─
+
+    def _owns(self, role: str) -> bool:
+        return role in OWNED_BOARD_ROLES
+
+    def _drop_lock(self, port: str) -> None:
+        """Close this port's lock fd, releasing the flock for the other plugin."""
+        fd = self._port_locks.pop(port, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _cache_role(self, b: Board) -> None:
+        if not self.role_cache:
+            return
+        keys = [os.path.realpath(b.port)]
+        if b.mac:
+            keys.append(b.mac)
+        with self._cache_lock:
+            for key in keys:
+                cache_write(self.role_cache, key, b.role)
+
+    def _cached_role(self, port: str):
+        """The role the cache attributes to this node (by MAC when the node
+        carries one, else by its real device path), or None when unknown."""
+        if not self.role_cache:
+            return None
+        key = usb_mac(port) or os.path.realpath(port)
+        return cache_read(self.role_cache).get(key)
 
     def _node_after_reset(self, b: Board) -> str | None:
         """The node that took over `b`'s interface after esptool's hard reset
@@ -435,61 +567,23 @@ class Esp32Plugin(Plugin):
             raise ActionError(f"esptool reset exited {rc} on {b.port}: {tail}",
                               code="reset_failed")
 
-    # ── the fake hub ──────────────────────────────────────────
+    # ── identification & lifecycle ──────────────────────────────
 
     def _identifying(self) -> list:
         return [b for b in self.boards() if b.online and b.vt is None]
 
-    def update_fake_hub(self) -> None:
-        """Start/stop the fake hub. `on`: always running. `auto`: running while no
-        `role: hub` board is attached (decided once every board has answered or
-        failed its status probe), so sensors and the app move to a real hub as soon
-        as one appears. `off`: never."""
-        hub = self.fake_hub
-        if hub is None or not self._scanned:
-            return
-        with self._fake_lock:
-            if self.fake_hub_mode == "on":
-                want = True
-            else:
-                if self._identifying():
-                    return
-                want = not any(b.role == "hub" for b in self.boards() if b.online)
-            if want and not hub.active:
-                try:
-                    hub.start()
-                except OSError:
-                    self.events.publish(hub.id, "state", {"state": "error", "error": hub.error})
-                    return
-                self.events.publish(hub.id, "state", {"state": "ready", "role": "hub",
-                                                      "fake": True, "url": hub.url})
-            elif not want and hub.active:
-                hub.stop()
-                self.events.publish(hub.id, "state", {"state": "removed", "role": "hub",
-                                                      "fake": True,
-                                                      "reason": "a hub board is attached"})
-
-    def _fake_hub_json(self) -> dict:
-        hub = self.fake_hub
-        busy = bool(self.jobs and self.jobs.is_busy(hub.id))
-        st = hub.status()
-        return {"id": hub.id, "kind": "esp32", "model": "fake hub",
-                "state": "busy" if busy else "ready",
-                "details": {"role": "hub", "fake": True, "mac": hub.mac, "url": hub.url,
-                            "device": st["device"], "ip": st["ip"], "port": st["port"],
-                            "sensors": st["sensors"], "rules": st["rules"],
-                            "mdns": st["mdns"]}}
-
     def close(self) -> None:
-        if self.fake_hub is not None:
-            self.fake_hub.stop()
+        """Give up every board console: release all port locks so the other
+        plugin's next scan can take them (the OS would drop them on exit
+        anyway; this makes a plain stop tidy)."""
+        for port in list(self._port_locks):
+            self._drop_lock(port)
 
     def _rescan_loop(self) -> None:
         while True:
             time.sleep(RESCAN_S)
             try:
                 self.rescan()
-                self.update_fake_hub()
             except Exception as e:  # noqa: BLE001
                 self._error = f"rescan failed: {e}"
 
@@ -504,16 +598,10 @@ class Esp32Plugin(Plugin):
         for b in self.boards():
             busy = bool(self.jobs and self.jobs.is_busy(b.id))
             out.append(b.to_json(busy))
-        if self.fake_hub is not None and self.fake_hub.active:
-            out.append(self._fake_hub_json())
         return out
 
     def device_error(self):
-        if self._error:
-            return self._error
-        if self.fake_hub is not None and self.fake_hub.error:
-            return f"fake hub: {self.fake_hub.error}"
-        return None
+        return self._error
 
     def _wait_identified(self) -> None:
         end = time.monotonic() + IDENTIFY_WAIT_S
@@ -521,20 +609,18 @@ class Esp32Plugin(Plugin):
             time.sleep(0.05)
 
     def resolve_device(self, ref):
-        """`device=` is a MAC (or serial port), `sensor`, or `hub`; omitted = `sensor`."""
+        """`device=` is a MAC (or serial port), `sensor` or omitted: this
+        plugin only owns sensor boards; hub/server boards are the
+        esp32-server plugin's."""
         if isinstance(ref, str):
             ref = ref.strip()
         if ref in (None, "", "sensor"):
             return self._resolve_sensor()
-        if ref == "hub":
-            return self._resolve_hub()
-        hub = self.fake_hub
-        if hub is not None and isinstance(ref, str) and ref.lower() in (hub.id, hub.mac):
-            if not hub.active:
-                raise HttpError(404, "unknown_device",
-                                "the fake hub isn't running (a hub board is attached, or "
-                                f"it failed to start: {hub.error})")
-            return hub.id, hub
+        if ref in ("hub", "server"):
+            raise HttpError(404, "wrong_plugin",
+                            "hub/server boards and the fake server belong to "
+                            "the esp32-server plugin; this plugin only owns "
+                            "sensor boards")
         for b in self.boards():
             if ref in (b.id, b.mac, b.port) or os.path.realpath(str(ref)) == os.path.realpath(b.port):
                 return b.id, b
@@ -553,30 +639,6 @@ class Esp32Plugin(Plugin):
         raise HttpError(400, "bad_request",
                         f"{len(sensors)} sensor boards attached; pass device=<mac> "
                         f"({', '.join(b.id for b in sensors)})")
-
-    def _resolve_hub(self):
-        hub = self.fake_hub
-        if self.fake_hub_mode == "on":
-            self.update_fake_hub()
-            if not hub.active:
-                raise HttpError(404, "unknown_device", f"the fake hub isn't running: {hub.error}")
-            return hub.id, hub
-        self._wait_identified()
-        hubs = [b for b in self.boards() if b.role == "hub"]
-        if len(hubs) == 1:
-            return hubs[0].id, hubs[0]
-        if len(hubs) > 1:
-            raise HttpError(400, "bad_request",
-                            f"{len(hubs)} hub boards attached; pass device=<mac> "
-                            f"({', '.join(b.id for b in hubs)})")
-        if hub is None:
-            raise HttpError(404, "unknown_device",
-                            "no hub board attached (and ESP32_FAKE_HUB=off)")
-        self.update_fake_hub()
-        if not hub.active:
-            raise HttpError(404, "unknown_device", f"no hub board attached and the fake hub "
-                            f"isn't running: {hub.error}")
-        return hub.id, hub
 
     def resolve_path(self, value: str) -> str:
         if value.startswith("upload:"):
@@ -637,7 +699,7 @@ class Esp32Plugin(Plugin):
                    "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
                    "The rule language is the firmware's (TemperatureSensor "
                    "docs/vt-control.md, hub-protocol.md section 6): HTTP rules go to "
-                   "device=hub (the fake hub applies them itself), `report`/`temp`/`wifi` "
+                   "the esp32-server plugin (device=hub there), `report`/`temp`/`wifi` "
                    "directives to the sensor. Blank and # lines are skipped. Stops at the "
                    "first line the device rejects.",
                    self.act_expect,
@@ -646,36 +708,12 @@ class Esp32Plugin(Plugin):
                    default_timeout_ms=30_000),
             Action("clear", "Drop every expectation: the board behaves normally again.",
                    self.act_clear, default_timeout_ms=10_000),
-            Action("forget",
-                   "Hub only (device=hub): forget a sensor, like DELETE /devices/<mac> "
-                   "(registry entry and history). A sensor that still reports registers "
-                   "again on its next report.",
-                   self.act_forget,
-                   {"mac": Param("string", "the sensor's MAC (aa:bb:cc:dd:ee:ff)",
-                                 required=True)},
-                   default_timeout_ms=10_000),
         ]
+        # Sensor-only: hub/server actions (`forget`) live in the esp32-server
+        # plugin, and every device here is a sensor, so no action filtering.
         return {a.name: a for a in acts}
 
     # helpers
-
-    @staticmethod
-    def _fake(ctx: JobContext) -> FakeHub | None:
-        return ctx.device if isinstance(ctx.device, FakeHub) else None
-
-    def _not_on_fake_hub(self, ctx: JobContext, action: str) -> None:
-        if self._fake(ctx):
-            raise ActionError(f"{action} is not supported on the fake hub (it is software on "
-                              "the plugin host: no firmware, reset line or radio)",
-                              code="unsupported")
-
-    @staticmethod
-    def _sensor_only(ctx: JobContext, action: str) -> None:
-        b = ctx.device
-        if isinstance(b, Board) and b.role == "hub":
-            raise ActionError(f"{action} is a sensor action; the hub board has no "
-                              "provisioning window (its Wi-Fi is set at build time)",
-                              code="wrong_role")
 
     @staticmethod
     def _rule_rejected(n: int, rule: str, msg) -> ActionFailed:
@@ -719,7 +757,6 @@ class Esp32Plugin(Plugin):
         return dict(b.status or {})
 
     def act_flash(self, ctx: JobContext, p: dict):
-        self._not_on_fake_hub(ctx, "flash")
         b: Board = ctx.device
         build_dir, args = find_flasher_args(p["firmware_dir"])
         argv = build_flash_argv(b.port, build_dir, args,
@@ -748,7 +785,6 @@ class Esp32Plugin(Plugin):
         return result
 
     def act_reset(self, ctx: JobContext, p: dict):
-        self._not_on_fake_hub(ctx, "reset")
         b: Board = ctx.device
         seq = b.line_seq
         if b.kind == PORT_UART_BRIDGE:
@@ -761,11 +797,6 @@ class Esp32Plugin(Plugin):
         return {}
 
     def act_factory_reset(self, ctx: JobContext, p: dict):
-        hub = self._fake(ctx)
-        if hub:
-            hub.factory_reset()
-            ctx.log("fake hub: registry, history and rules erased")
-            return {"status": hub.status()}
         b: Board = ctx.device
         seq = b.line_seq
         reply = b.command(ctx, "factory-reset")
@@ -776,16 +807,11 @@ class Esp32Plugin(Plugin):
         if status.get("rules"):
             raise ActionFailed(f"board still has {status['rules']} rule(s) after reboot",
                                result={"status": status})
-        if status.get("role") == "hub":
-            ctx.log(f"factory settings: {status.get('sensors')} sensor(s) known")
-        else:
-            ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
-                    f"provisioning ssid {status.get('ap_ssid')!r}")
+        ctx.log(f"factory settings: station ssid {status.get('ssid')!r}, "
+                f"provisioning ssid {status.get('ap_ssid')!r}")
         return {"status": status}
 
     def act_broadcast_ssid(self, ctx: JobContext, p: dict):
-        self._not_on_fake_hub(ctx, "broadcast-ssid")
-        self._sensor_only(ctx, "broadcast-ssid")
         b: Board = ctx.device
         cmd = "ap-start" if p["seconds"] is None else f"ap-start {p['seconds']}"
         status = b.command(ctx, cmd)
@@ -796,8 +822,6 @@ class Esp32Plugin(Plugin):
         return {"ssid": status.get("ap_ssid"), "status": status}
 
     def act_ble_advertise(self, ctx: JobContext, p: dict):
-        self._not_on_fake_hub(ctx, "ble-advertise")
-        self._sensor_only(ctx, "ble-advertise")
         b: Board = ctx.device
         cmd = "prov-start" if p["seconds"] is None else f"prov-start {p['seconds']}"
         reply = b.request(ctx, cmd)
@@ -827,16 +851,8 @@ class Esp32Plugin(Plugin):
         rules = [ln for ln in rules if ln and not ln.startswith("#")]
         if not rules:
             raise ActionError("script has no rules", code="bad_request")
-        hub = self._fake(ctx)
         count = None
         for n, rule in enumerate(rules, 1):
-            if hub:
-                ctx.log(f"fake hub <- rule {rule}")
-                try:
-                    count = hub.add_rule(rule)
-                except ValueError as e:
-                    raise self._rule_rejected(n, rule, str(e)) from None
-                continue
             reply = ctx.device.request(ctx, "rule " + rule)
             if not reply.ok:
                 msg = (reply.payload.get("error") if isinstance(reply.payload, dict)
@@ -847,40 +863,19 @@ class Esp32Plugin(Plugin):
         return {"rules": count, "applied": len(rules)}
 
     def act_clear(self, ctx: JobContext, p: dict):
-        hub = self._fake(ctx)
-        if hub:
-            hub.clear()
-            return {"rules": 0}
         return ctx.device.command(ctx, "clear")
-
-    def act_forget(self, ctx: JobContext, p: dict):
-        mac = p["mac"].strip().lower()
-        if not MAC_RE.match(mac):
-            raise ActionError(f"bad mac {p['mac']!r} (expected aa:bb:cc:dd:ee:ff)",
-                              code="bad_request")
-        hub = self._fake(ctx)
-        if hub:
-            if not hub.forget(mac):
-                raise ActionFailed(f"the hub doesn't know {mac}", code="device_error",
-                                   result={"mac": mac})
-            return {"forgotten": mac, "sensors": hub.status()["sensors"]}
-        b: Board = ctx.device
-        if b.role != "hub":
-            raise ActionError("forget is a hub action; use device=hub", code="wrong_role")
-        reply = b.command(ctx, f"forget {mac}")
-        return {"forgotten": mac, "reply": reply}
-
 
 def main() -> None:
     plugin = Esp32Plugin()
     server = PluginServer(plugin, os.environ.get("PLUGIN_BIND", "0.0.0.0"),
-                          _env_int("PLUGIN_PORT", 8091), os.environ.get("PLUGIN_TOKEN") or None)
+                          _env_int("PLUGIN_PORT", PLUGIN_DEFAULT_PORT),
+                          os.environ.get("PLUGIN_TOKEN") or None)
     plugin.jobs = server.jobs
-    # systemd/launchd stop with SIGTERM: exit through `finally` so mDNS says goodbye.
+    # systemd/launchd stop with SIGTERM: exit through `finally` so the board
+    # console locks are released for the other plugin.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    print(f"VisualTester-Esp32 {VERSION} (contract {ps.CONTRACT} v{ps.CONTRACT_VERSION}) "
-          f"on :{server.port}; ports {plugin.port_specs}; fake hub {plugin.fake_hub_mode}",
-          flush=True)
+    print(f"VisualTester {plugin.name} {VERSION} (contract {ps.CONTRACT} "
+          f"v{ps.CONTRACT_VERSION}) on :{server.port}; ports {plugin.port_specs}", flush=True)
     for b in plugin.boards():
         print(f"  board on {b.port}", flush=True)
     try:
@@ -888,7 +883,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        plugin.close()  # unregister the fake hub's mDNS name
+        plugin.close()  # release every board console lock
 
 
 if __name__ == "__main__":
