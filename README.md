@@ -34,20 +34,84 @@ answered with `wrong_plugin` — run the step against the esp32-server plugin
 instead. When this plugin finds a hub board it drops it and releases its
 console lock so esp32-server can adopt it.
 
-## Run it
+## Install
 
-**Nix (Linux or macOS):**
+| Dependency | Why | Required |
+|---|---|---|
+| Python 3.10 or newer | the plugin | yes |
+| pyserial | the boards' serial consoles | yes |
+| esptool | `flash`, and resetting native USB-Serial-JTAG boards | yes |
+| Membership of the `dialout` group | opening `/dev/ttyUSB*` / `/dev/ttyACM*` | on Linux |
 
 ```bash
-nix run                    # plugin on 0.0.0.0:8091
-nix run .#tests            # unit tests against a fake board
+git clone http://192.168.125.70:3000/blackjackfruit/VisualTester-Esp32-Sensor.git ~/Workspace/VisualTester-Esp32-Sensor
+cd ~/Workspace/VisualTester-Esp32-Sensor
 ```
 
-**Without Nix:** Python 3.10+, then
+`~/Workspace/VisualTester-Esp32-Sensor` is the path the systemd unit in `packaging/` expects.
+
+### With Nix (Linux or macOS)
+
+Needs Nix with flakes enabled (`experimental-features = nix-command flakes` in
+`~/.config/nix/nix.conf`). The flake brings Python, the Python packages and esptool, so
+there is nothing else to install:
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install pyserial esptool
-.venv/bin/python esp32_plugin.py
+nix run .#tests            # unit tests against fake boards
+nix run                    # the plugin on 0.0.0.0:8091
+nix develop                # a shell with python3 + the packages + esptool
+```
+
+### Without Nix
+
+**Debian / Ubuntu:**
+
+```bash
+sudo apt-get install -y python3 python3-venv git
+python3 -m venv .venv
+.venv/bin/pip install pyserial esptool
+```
+
+**macOS (Homebrew):**
+
+```bash
+brew install python git
+python3 -m venv .venv
+.venv/bin/pip install pyserial esptool
+```
+
+The plugin finds esptool on `PATH`, else runs `<its python> -m esptool`, so the venv's copy
+is enough.
+
+### Serial-port access (Linux)
+
+```bash
+sudo usermod -aG dialout "$USER"   # then log out and back in
+id -nG | grep -w dialout           # prints dialout when it worked
+```
+
+### Verify
+
+```bash
+# With Nix
+nix run .#tests
+nix develop -c esptool version
+
+# Without Nix
+.venv/bin/python -c "import serial, esptool"
+.venv/bin/python -m unittest discover -s tests
+```
+
+The tests use a fake board and a fake esptool, so they need no hardware. Then start the
+plugin (below) and check `curl -s localhost:8091/health`.
+
+## Run it
+
+Install the dependencies first (see [Install](#install)), then:
+
+```bash
+nix run                          # plugin on 0.0.0.0:8091
+.venv/bin/python esp32_plugin.py # the same, without Nix
 ```
 
 Check it with `curl localhost:8091/health` and `curl localhost:8091/devices`.
