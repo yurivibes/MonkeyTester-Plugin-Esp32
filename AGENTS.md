@@ -7,6 +7,21 @@ protocol, behind the shared Device Plugin API. Hub/server boards and the fake
 software server are the sibling plugin's (VisualTester-Esp32-Server, `esp32-server`,
 :8093). See README.md.
 
+## Setup (do this first)
+Install the dependencies with the steps in README.md → **Install** before running or testing
+anything; that section is the single source for them. In short:
+- **Nix available** (`command -v nix`): nothing to install. `nix run .#tests` runs the tests,
+  `nix run` starts the plugin on :8091, `nix develop` gives a shell with Python, pyserial
+  and esptool.
+- **No Nix:** Python 3.10+, then a `.venv` with `pip install pyserial esptool`
+  (README.md → Install → Without Nix).
+- On Linux, opening real boards needs the `dialout` group; the tests don't (they use
+  `tests/fake_board.py` and `tests/fake_esptool.py`).
+- Don't start the plugin on this host to try a change while the live
+  `visualtester-esp32-sensor` service runs: it holds the boards' serial ports. The tests need no hardware.
+- A new dependency goes into README.md → Install and `flake.nix` in the same PR. If a step in
+  README.md → Install doesn't work as written, fix it in the same PR.
+
 ## Critical Rules
 - **The plugin API is a contract.** `plugin_server.py` implements
   `PLUGIN_API.md` from the VisualTester repo. Don't add or change endpoints,
