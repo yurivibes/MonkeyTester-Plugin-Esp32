@@ -146,7 +146,7 @@ class ContractTests(unittest.TestCase):
     def test_health(self):
         code, h = self.h.call("GET", "/health")
         self.assertEqual(code, 200)
-        self.assertEqual(h["contract"], "visualtester-plugin")
+        self.assertEqual(h["contract"], "trustthetest-plugin")
         self.assertEqual(h["contract_version"], 1)
         self.assertEqual(h["plugin"]["name"], "esp32-sensor")
         self.assertEqual(h["devices"], 1)

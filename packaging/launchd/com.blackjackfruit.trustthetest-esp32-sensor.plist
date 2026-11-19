@@ -3,13 +3,13 @@
 <!-- macOS LaunchAgent, esp32-sensor plugin: owns the `role: sensor` boards.
      Replace CHECKOUT_DIR and PYTHON (a python with pyserial and esptool), copy
      to ~/Library/LaunchAgents/, then:
-     launchctl load ~/Library/LaunchAgents/com.blackjackfruit.visualtester-esp32-sensor.plist
+     launchctl load ~/Library/LaunchAgents/com.blackjackfruit.trustthetest-esp32-sensor.plist
      Run the esp32-server LaunchAgent alongside; the two plugins split the
      boards by role and share the console locks and the role cache (files
      under /tmp by default: /tmp/vt-esp32-locks, /tmp/vt-esp32-roles.json). -->
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.blackjackfruit.visualtester-esp32-sensor</string>
+  <key>Label</key><string>com.blackjackfruit.trustthetest-esp32-sensor</string>
   <key>ProgramArguments</key>
   <array>
     <string>PYTHON</string>
@@ -23,7 +23,7 @@
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/visualtester-esp32-sensor.log</string>
-  <key>StandardErrorPath</key><string>/tmp/visualtester-esp32-sensor.log</string>
+  <key>StandardOutPath</key><string>/tmp/trustthetest-esp32-sensor.log</string>
+  <key>StandardErrorPath</key><string>/tmp/trustthetest-esp32-sensor.log</string>
 </dict>
 </plist>
