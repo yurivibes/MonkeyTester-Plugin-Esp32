@@ -1,10 +1,10 @@
-# VisualTester-Esp32-Sensor — Agent Guide
+# TrustTheTest-Esp32-Sensor — Agent Guide
 
 ## Purpose
-The `esp32-sensor` device plugin for VisualTester: flashes prebuilt firmware
+The `esp32-sensor` device plugin for TrustTheTest: flashes prebuilt firmware
 onto the **sensor** ESP32 boards and drives them over the VT control serial
 protocol, behind the shared Device Plugin API. Hub/server boards and the fake
-software server are the sibling plugin's (VisualTester-Esp32-Server, `esp32-server`,
+software server are the sibling plugin's (TrustTheTest-Esp32-Server, `esp32-server`,
 :8093). See README.md.
 
 ## Setup (do this first)
@@ -18,13 +18,13 @@ anything; that section is the single source for them. In short:
 - On Linux, opening real boards needs the `dialout` group; the tests don't (they use
   `tests/fake_board.py` and `tests/fake_esptool.py`).
 - Don't start the plugin on this host to try a change while the live
-  `visualtester-esp32-sensor` service runs: it holds the boards' serial ports. The tests need no hardware.
+  `trustthetest-esp32-sensor` service runs: it holds the boards' serial ports. The tests need no hardware.
 - A new dependency goes into README.md → Install and `flake.nix` in the same PR. If a step in
   README.md → Install doesn't work as written, fix it in the same PR.
 
 ## Critical Rules
 - **The plugin API is a contract.** `plugin_server.py` implements
-  `PLUGIN_API.md` from the VisualTester repo. Don't add or change endpoints,
+  `PLUGIN_API.md` from the TrustTheTest repo. Don't add or change endpoints,
   job states or fields here without changing that document first (and bumping
   `contract_version` for breaking changes).
 - **The device protocol is owned by the firmware.** Board commands and the rule
