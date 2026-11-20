@@ -14,6 +14,17 @@ After=network-online.target
 [Service]
 WorkingDirectory=%h/Workspace/MonkeyTester-Esp32-Sensor
 ExecStart=/usr/bin/env nix run .
+# Network access (SECURITY.md): the plugin API listens on 127.0.0.1 by default,
+# which is what the viewer on this host uses (http://127.0.0.1:8091). To expose it
+# on the LAN, set BOTH lines below; without a token (>= 16 chars) the plugin
+# refuses to start on a non-loopback address. Prefer a drop-in
+# (systemctl --user edit monkeytester-esp32-sensor) so the token stays out of
+# this file, and enter the same token in the viewer's Settings.
+#Environment=PLUGIN_BIND=0.0.0.0
+#Environment=PLUGIN_TOKEN=<openssl rand -hex 32>
+# Extra directories `flash` may read firmware from (default: this checkout,
+# the upload dir and /nix/store):
+#Environment=ESP32_FIRMWARE_ROOTS=%h/Workspace/Esp32-Sensor
 Restart=on-failure
 RestartSec=5
 
