@@ -1,6 +1,6 @@
-"""Generic TrustTheTest Device Plugin API server (contract_version 1).
+"""Generic MonkeyTester Device Plugin API server (contract_version 1).
 
-Implements the HTTP side of PLUGIN_API.md (in the TrustTheTest repo): health,
+Implements the HTTP side of PLUGIN_API.md (in the MonkeyTester repo): health,
 devices, actions, jobs (start / long-poll wait / cancel), server-sent events and
 zip uploads. It knows nothing about ESP32 boards: a plugin hands it a `Plugin`
 object (see esp32_plugin.py) and gets the whole contract for free.
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-CONTRACT = "trustthetest-plugin"
+CONTRACT = "monkeytester-plugin"
 CONTRACT_VERSION = 1
 
 TERMINAL_STATES = {"passed", "failed", "timeout", "error", "cancelled"}

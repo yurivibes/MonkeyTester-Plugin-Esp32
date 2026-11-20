@@ -1,7 +1,7 @@
 # esp32-sensor plugin actions
 
 Every action runs as a job (`POST /jobs`, then `GET /jobs/<id>?wait=…`; see
-`PLUGIN_API.md` in TrustTheTest). `GET /actions` returns the same list with full
+`PLUGIN_API.md` in MonkeyTester). `GET /actions` returns the same list with full
 parameter schemas.
 
 ## Devices and roles
@@ -50,7 +50,7 @@ MAC to the new node — `details.port` changes, its id and events don't. The
 ## The fake server — not here
 
 The software server (hub HTTP API on :8092, registry/history, rule language,
-mDNS `tshub-fake`) lives in the sibling **TrustTheTest-Esp32-Server** plugin
+mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Esp32-Server** plugin
 with its full documentation (`esp32-server` on :8093). Tests don't change
 between the fake and a real hub board; they run against the esp32-server
 plugin either way.
