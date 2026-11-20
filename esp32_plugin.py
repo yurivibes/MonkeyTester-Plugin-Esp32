@@ -18,9 +18,11 @@ number that is the board's MAC, which identifies it before it answers VT
 control. `GET /devices` reports `details.port_kind`.
 
 Environment:
-  PLUGIN_BIND        listen address           (default 0.0.0.0)
+  PLUGIN_BIND        listen address           (default 127.0.0.1, loopback only)
   PLUGIN_PORT        listen port              (default 8091)
-  PLUGIN_TOKEN       if set, required as X-Plugin-Token on every request
+  PLUGIN_TOKEN       required as X-Plugin-Token on every request but GET /health;
+                     MANDATORY (>= 16 chars) when PLUGIN_BIND is not loopback:
+                     the plugin refuses to start otherwise (SECURITY.md)
   ESP32_PORTS        comma-separated serial ports or globs to use
                      (default: USB-UART ports for this OS, see DEFAULT_GLOBS)
   ESP32_BAUD         console baud rate        (default 115200)
@@ -31,6 +33,9 @@ Environment:
                      "<this python> -m esptool")
   ESP32_FIRMWARE_ROOT  relative firmware_dir values resolve against this
                      (default: the current directory)
+  ESP32_FIRMWARE_ROOTS extra directories (os.pathsep-separated) a firmware_dir
+                     may point into; anything outside ESP32_FIRMWARE_ROOT, these,
+                     the upload dir and /nix/store is refused
   ESP32_READY_TIMEOUT_S  how long to wait for `@vt - ready` after boot (default 20)
   PLUGIN_UPLOAD_DIR  where POST /uploads unpacks zips (default: <tmp>/vt-plugin-uploads)
   ESP32_LOCK_DIR     per-node lock files shared with the esp32-server plugin
@@ -51,12 +56,14 @@ import re
 import shlex
 import shutil
 import signal
-import subprocess
+import subprocess  # nosec B404 - argv lists only (esptool), never a shell
 import sys
+import tempfile
 import threading
 import time
 
 import plugin_server as ps
+import security
 from board import PORT_USB_SERIAL_JTAG, PORT_UART_BRIDGE, Board, port_kind
 from plugin_server import (Action, ActionError, ActionFailed, HttpError, JobContext,
                            Param, Plugin, PluginServer, Uploads)
@@ -84,8 +91,12 @@ PLUGIN_DEFAULT_PORT = 8091
 # esp32-server plugin, never to this one.
 OWNED_BOARD_ROLES = ("sensor",)
 OTHER_BOARD_ROLES = ("hub", "server")
-LOCK_DIR_DEFAULT = "/tmp/vt-esp32-locks"
-ROLE_CACHE_DEFAULT = "/tmp/vt-esp32-roles.json"
+# Fixed /tmp paths on purpose: they are the cross-process protocol with the
+# sibling plugin and must be identical in both repos. Files are opened without
+# following symlinks (locks) or replaced atomically from a private temp file
+# (role cache); see SECURITY.md for the shared-/tmp caveat.
+LOCK_DIR_DEFAULT = "/tmp/vt-esp32-locks"  # nosec B108 - shared protocol path, see above
+ROLE_CACHE_DEFAULT = "/tmp/vt-esp32-roles.json"  # nosec B108 - shared protocol path
 
 
 def _env_int(name, default):
@@ -109,9 +120,9 @@ def try_lock_port(lock_dir: str, port: str):
     is the only plugin and keep the pre-split behaviour).
     """
     try:
-        os.makedirs(lock_dir, exist_ok=True)
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
         fd = os.open(os.path.join(lock_dir, _lock_name(port)),
-                     os.O_RDWR | os.O_CREAT)
+                     os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError:
         return False
     try:
@@ -137,10 +148,20 @@ def cache_write(path: str, key: str, value: str) -> None:
     try:
         data = cache_read(path)
         data[key] = value
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=1)
-        os.replace(tmp, path)
+        # A private, uniquely named temp file (O_EXCL, never a pre-planted
+        # symlink), then an atomic rename over the cache.
+        fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                                   dir=os.path.dirname(path) or ".")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except OSError:
         pass
 
@@ -196,12 +217,68 @@ def esptool_command() -> list:
     return [sys.executable, "-m", "esptool"]
 
 
+# flasher_args.json comes from the firmware dir (possibly an upload), so every
+# value it puts on esptool's command line is checked against these.
+CHIP_RE = re.compile(r"^esp32[a-z0-9]*$")
+ESPTOOL_RESET_MODES = frozenset({
+    "default_reset", "default-reset", "no_reset", "no-reset", "no_reset_no_sync",
+    "no-reset-no-sync", "usb_reset", "usb-reset", "hard_reset", "hard-reset",
+    "soft_reset", "soft-reset", "watchdog_reset", "watchdog-reset"})
+WRITE_FLASH_OPTIONS = frozenset({
+    "--flash_mode", "--flash-mode", "--flash_size", "--flash-size", "--flash_freq",
+    "--flash-freq", "--compress", "-z", "--no-compress", "-u"})
+WRITE_FLASH_VALUE_RE = re.compile(r"^[A-Za-z0-9_.]{1,32}$")
+FLASH_ADDR_RE = re.compile(r"^(0x[0-9a-fA-F]{1,8}|[0-9]{1,10})$")
+
+
+def _bad_firmware(msg: str) -> ActionError:
+    return ActionError(f"flasher_args.json: {msg}", code="bad_firmware")
+
+
+def _checked_write_flash_args(values) -> list:
+    if not isinstance(values, list):
+        raise _bad_firmware("write_flash_args must be a list")
+    out = []
+    for v in values:
+        if not isinstance(v, str):
+            raise _bad_firmware(f"write_flash_args entry {v!r} is not a string")
+        if v.startswith("-"):
+            if v not in WRITE_FLASH_OPTIONS:
+                raise _bad_firmware(f"write_flash option {v!r} is not allowed")
+        elif not WRITE_FLASH_VALUE_RE.match(v):
+            raise _bad_firmware(f"write_flash value {v!r} is not allowed")
+        out.append(v)
+    return out
+
+
+def _checked_image(build_dir: str, addr, rel) -> tuple[str, str]:
+    if not isinstance(addr, str) or not FLASH_ADDR_RE.match(addr):
+        raise _bad_firmware(f"bad flash address {addr!r}")
+    if (not isinstance(rel, str) or not rel or "\0" in rel or os.path.isabs(rel)
+            or ".." in re.split(r"[/\\]+", rel) or not rel.lower().endswith(".bin")):
+        raise _bad_firmware(f"bad image path {rel!r} (a relative .bin path)")
+    path = os.path.join(build_dir, rel)
+    if not security.within(path, build_dir):
+        raise _bad_firmware(f"image {rel!r} resolves outside the firmware dir")
+    if not os.path.isfile(path):
+        raise ActionError(f"missing image {path}", code="bad_firmware")
+    return addr, path
+
+
 def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bool,
                      kind: str | None = None) -> list:
+    if not isinstance(args, dict):
+        raise _bad_firmware("not a JSON object")
     extra = args.get("extra_esptool_args") or {}
     files = args.get("flash_files") or {}
+    if not isinstance(extra, dict) or not isinstance(files, dict):
+        raise _bad_firmware("extra_esptool_args / flash_files must be objects")
     if not files:
         raise ActionError("flasher_args.json lists no flash_files", code="bad_firmware")
+    try:
+        security.check_argv_value(port)
+    except ValueError as e:
+        raise ActionError(str(e), code="port_error") from None
     argv = esptool_command()
     if extra.get("stub") is False:
         argv.append("--no-stub")
@@ -209,19 +286,23 @@ def build_flash_argv(port: str, build_dir: str, args: dict, baud: int, erase: bo
     if kind != PORT_USB_SERIAL_JTAG:
         # A native USB-Serial-JTAG port is CDC-ACM: there is no transfer baud
         # rate there, and esptool takes --port (not --serial) in v5.x.
-        argv += ["--baud", str(baud)]
-    if extra.get("chip"):
-        argv += ["--chip", extra["chip"]]
-    argv += ["--before", extra.get("before", "default_reset"),
-             "--after", extra.get("after", "hard_reset"),
-             "write_flash"]
+        argv += ["--baud", str(int(baud))]
+    chip = extra.get("chip")
+    if chip:
+        if not isinstance(chip, str) or not CHIP_RE.match(chip):
+            raise _bad_firmware(f"bad chip {chip!r}")
+        argv += ["--chip", chip]
+    before = extra.get("before", "default_reset")
+    after = extra.get("after", "hard_reset")
+    for what, mode in (("before", before), ("after", after)):
+        if mode not in ESPTOOL_RESET_MODES:
+            raise _bad_firmware(f"bad {what} reset mode {mode!r}")
+    argv += ["--before", before, "--after", after, "write_flash"]
     if erase:
         argv.append("--erase-all")
-    argv += list(args.get("write_flash_args") or [])
-    for addr, rel in sorted(files.items(), key=lambda kv: int(kv[0], 0)):
-        path = os.path.join(build_dir, rel)
-        if not os.path.isfile(path):
-            raise ActionError(f"missing image {path}", code="bad_firmware")
+    argv += _checked_write_flash_args(args.get("write_flash_args") or [])
+    images = [_checked_image(build_dir, addr, rel) for addr, rel in files.items()]
+    for addr, path in sorted(images, key=lambda ap: int(ap[0], 0)):
         argv += [addr, path]
     return argv
 
@@ -233,14 +314,17 @@ def esptool_reset_argv(port: str) -> list:
     identify command (`flash-id` reads the flash geometry, writes nothing) run
     with the default `--after hard_reset` ends with esptool's own hard reset,
     which is what resets the chip on that port."""
+    security.check_argv_value(port)
     return esptool_command() + ["--port", port, "--after", "hard_reset", "flash-id"]
 
 
 def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
     ctx.log("$ " + " ".join(shlex.quote(a) for a in argv))
     try:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, errors="replace")
+        # argv list, no shell: values from requests/firmware dirs were validated
+        # (build_flash_argv, security.check_argv_value).
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,  # nosec B603
+                                stderr=subprocess.STDOUT, text=True, errors="replace")
     except FileNotFoundError as e:
         raise ActionError(f"can't run {argv[0]}: {e}", code="tool_missing") from None
     out = []
@@ -554,9 +638,9 @@ class Esp32Plugin(Plugin):
         b.pause()
         try:
             if ctx is None:  # outside a job: no transcript to pump into
-                proc = subprocess.run(argv, stdout=subprocess.PIPE,
+                proc = subprocess.run(argv, stdout=subprocess.PIPE,  # nosec B603 - argv list
                                       stderr=subprocess.STDOUT, text=True,
-                                      errors="replace")
+                                      errors="replace", check=False)
                 rc, out = proc.returncode, proc.stdout
             else:
                 rc, out = run_tool(ctx, argv)
@@ -612,8 +696,11 @@ class Esp32Plugin(Plugin):
         """`device=` is a MAC (or serial port), `sensor` or omitted: this
         plugin only owns sensor boards; hub/server boards are the
         esp32-server plugin's."""
-        if isinstance(ref, str):
-            ref = ref.strip()
+        try:
+            ref = security.check_device_ref(ref, [b.port for b in self.boards()])
+        except ValueError as e:
+            # Same answer as any other unknown board (PLUGIN_API.md), with the reason.
+            raise HttpError(404, "unknown_device", f"no board like that: {e}") from None
         if ref in (None, "", "sensor"):
             return self._resolve_sensor()
         if ref in ("hub", "server"):
@@ -640,13 +727,23 @@ class Esp32Plugin(Plugin):
                         f"{len(sensors)} sensor boards attached; pass device=<mac> "
                         f"({', '.join(b.id for b in sensors)})")
 
+    def firmware_roots(self) -> list:
+        """Where a firmware_dir may point: ESP32_FIRMWARE_ROOT, the extra
+        ESP32_FIRMWARE_ROOTS, the upload dir, and /nix/store (a Nix `result`
+        link resolves there; the store is world-readable anyway)."""
+        roots = [self.firmware_root, self.uploads.root]
+        roots += [r for r in os.environ.get("ESP32_FIRMWARE_ROOTS", "").split(os.pathsep) if r]
+        if os.path.isdir("/nix/store"):
+            roots.append("/nix/store")
+        return roots
+
     def resolve_path(self, value: str) -> str:
         if value.startswith("upload:"):
             return self.uploads.resolve(value)
-        value = os.path.expanduser(value)
-        if not os.path.isabs(value):
-            value = os.path.join(self.firmware_root, value)
-        return os.path.abspath(value)
+        try:
+            return security.contained_path(value, self.firmware_root, self.firmware_roots())
+        except ValueError as e:
+            raise HttpError(400, "bad_request", f"firmware_dir: {e}") from None
 
     def actions(self) -> dict:
         return self._actions
@@ -866,16 +963,22 @@ class Esp32Plugin(Plugin):
         return ctx.device.command(ctx, "clear")
 
 def main() -> None:
+    # Bind/token policy first, before any board is opened: a non-loopback bind
+    # without a (long enough) PLUGIN_TOKEN refuses to start (SECURITY.md).
+    bind, token = security.bind_and_token_from_env()
+    err = security.bind_policy_error(bind, token)
+    if err:
+        print(f"{PLUGIN_NAME}: {err}", file=sys.stderr, flush=True)
+        sys.exit(2)
     plugin = Esp32Plugin()
-    server = PluginServer(plugin, os.environ.get("PLUGIN_BIND", "0.0.0.0"),
-                          _env_int("PLUGIN_PORT", PLUGIN_DEFAULT_PORT),
-                          os.environ.get("PLUGIN_TOKEN") or None)
+    server = PluginServer(plugin, bind, _env_int("PLUGIN_PORT", PLUGIN_DEFAULT_PORT), token)
     plugin.jobs = server.jobs
     # systemd/launchd stop with SIGTERM: exit through `finally` so the board
     # console locks are released for the other plugin.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(f"MonkeyTester {plugin.name} {VERSION} (contract {ps.CONTRACT} "
-          f"v{ps.CONTRACT_VERSION}) on :{server.port}; ports {plugin.port_specs}", flush=True)
+          f"v{ps.CONTRACT_VERSION}) on {bind}:{server.port} "
+          f"(token {'required' if token else 'off'}); ports {plugin.port_specs}", flush=True)
     for b in plugin.boards():
         print(f"  board on {b.port}", flush=True)
     try:
