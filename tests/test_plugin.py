@@ -35,7 +35,8 @@ class Harness:
     the same MAC in its USB metadata)."""
 
     def __init__(self, token=None, vt=True, ports=("/dev/fake0",), roles=None,
-                 transport="softap", macs=None, lock_dir="", role_cache=""):
+                 transport="softap", macs=None, lock_dir="", role_cache="",
+                 firmware_root=None):
         roles = roles or (None,) * len(ports)
         macs = macs or tuple(f"7c:df:a1:a4:8f:{i:02x}" for i in range(len(ports)))
         self.fws = {p: FakeFirmware(mac=m, vt=vt, role=r, transport=transport)
@@ -64,7 +65,9 @@ class Harness:
         self._orig_board = orig_board
         self._orig_candidates = Esp32Plugin._candidate_ports
         Esp32Plugin._candidate_ports = lambda s: list(ports)
+        # Test firmware dirs are mkdtemp()s: let them pass the firmware-root check.
         self.plugin = Esp32Plugin(ports=list(ports), rescan=False,
+                                  firmware_root=firmware_root or tempfile.gettempdir(),
                                   lock_dir=lock_dir, role_cache=role_cache)
         self.server = PluginServer(self.plugin, "127.0.0.1", 0, token)
         self.plugin.jobs = self.server.jobs
@@ -257,9 +260,12 @@ class TokenTests(unittest.TestCase):
     def test_token_required(self):
         h = Harness(token="s3cret")
         try:
-            code, r = h.call("GET", "/health", headers={"X-Plugin-Token": "wrong"})
+            code, r = h.call("GET", "/devices", headers={"X-Plugin-Token": "wrong"})
             self.assertEqual((code, r["code"]), (401, "unauthorized"))
-            code, r = h.call("GET", "/health")
+            code, r = h.call("GET", "/devices")
+            self.assertEqual(code, 200)
+            # /health stays open (the viewer's liveness check), more in test_security
+            code, r = h.call("GET", "/health", headers={"X-Plugin-Token": "wrong"})
             self.assertEqual(code, 200)
         finally:
             h.close()
