@@ -1,5 +1,5 @@
 {
-  description = "TrustTheTest-Esp32-Sensor: TrustTheTest device plugin for the ESP32 sensor boards";
+  description = "MonkeyTester-Esp32-Sensor: MonkeyTester device plugin for the ESP32 sensor boards";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -14,7 +14,7 @@
         src = pkgs.lib.cleanSource ./.;
 
         plugin = pkgs.writeShellApplication {
-          name = "trustthetest-esp32-sensor";
+          name = "monkeytester-esp32-sensor";
           runtimeInputs = [ python pkgs.esptool ];
           text = ''
             export PLUGIN_PORT="''${PLUGIN_PORT:-8091}"
@@ -23,7 +23,7 @@
         };
 
         tests = pkgs.writeShellApplication {
-          name = "trustthetest-esp32-sensor-tests";
+          name = "monkeytester-esp32-sensor-tests";
           runtimeInputs = [ python ];
           text = ''
             cd ${src}
@@ -32,12 +32,12 @@
         };
       in {
         packages.default = plugin;
-        packages.trustthetest-esp32-sensor = plugin;
+        packages.monkeytester-esp32-sensor = plugin;
 
         # nix run .#      -> esp32-sensor plugin on :8091
         # nix run .#tests -> unit tests against the fake boards
-        apps.default = { type = "app"; program = "${plugin}/bin/trustthetest-esp32-sensor"; };
-        apps.tests = { type = "app"; program = "${tests}/bin/trustthetest-esp32-sensor-tests"; };
+        apps.default = { type = "app"; program = "${plugin}/bin/monkeytester-esp32-sensor"; };
+        apps.tests = { type = "app"; program = "${tests}/bin/monkeytester-esp32-sensor-tests"; };
 
         devShells.default = pkgs.mkShell { packages = [ python pkgs.esptool ]; };
       });

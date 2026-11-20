@@ -1,27 +1,27 @@
-# TrustTheTest-Esp32-Sensor
+# MonkeyTester-Esp32-Sensor
 
 The `esp32-sensor` device plugin for
-[TrustTheTest](http://192.168.125.70:3000/blackjackfruit/TrustTheTest). It owns
+[MonkeyTester](http://192.168.125.70:3000/yurivibes/MonkeyTester). It owns
 the **`role: sensor`** ESP32 boards plugged into its host, flashes prebuilt
 firmware onto them, and relays a test's expectations (how the board should
 answer the app: a broken sensor reading, an HTTP error, a hang, going offline,
 …) to the board.
 
 Hub/server boards and the fake software server are **not here**: they belong to
-the sibling plugin [TrustTheTest-Esp32-Server](http://192.168.125.70:3000/blackjackfruit/TrustTheTest-Esp32-Server)
+the sibling plugin [MonkeyTester-Esp32-Server](http://192.168.125.70:3000/yurivibes/MonkeyTester-Esp32-Server)
 (`esp32-server`, on :8093). The two plugins discover the same nodes but split
 them by role: each probes a board's firmware `status`, keeps only its own role,
 and shares the boards through per-node console locks and a role cache, so two
 plugin processes never open the same serial console.
 
-TrustTheTest reaches it only through the shared **Device Plugin API**
-(`PLUGIN_API.md` in the TrustTheTest repo). Boards are driven over their serial
+MonkeyTester reaches it only through the shared **Device Plugin API**
+(`PLUGIN_API.md` in the MonkeyTester repo). Boards are driven over their serial
 console with the **VT control protocol** (`docs/vt-control.md` in
-[Esp32-Sensor](http://192.168.125.70:3000/blackjackfruit/Esp32-Sensor)),
+[Esp32-Sensor](http://192.168.125.70:3000/yurivibes/Esp32-Sensor)),
 which that firmware's `…-test` builds include.
 
 ```
-TrustTheTest ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or macOS)
+MonkeyTester ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or macOS)
                                      ├── esptool ───────────► flash
                                      └── serial (VT control) ► ESP32 sensor boards
                                         (hub/server boards → esp32-server plugin :8093)
@@ -44,11 +44,11 @@ console lock so esp32-server can adopt it.
 | Membership of the `dialout` group | opening `/dev/ttyUSB*` / `/dev/ttyACM*` | on Linux |
 
 ```bash
-git clone http://192.168.125.70:3000/blackjackfruit/TrustTheTest-Esp32-Sensor.git ~/Workspace/TrustTheTest-Esp32-Sensor
-cd ~/Workspace/TrustTheTest-Esp32-Sensor
+git clone http://192.168.125.70:3000/yurivibes/MonkeyTester-Esp32-Sensor.git ~/Workspace/MonkeyTester-Esp32-Sensor
+cd ~/Workspace/MonkeyTester-Esp32-Sensor
 ```
 
-`~/Workspace/TrustTheTest-Esp32-Sensor` is the path the systemd unit in `packaging/` expects.
+`~/Workspace/MonkeyTester-Esp32-Sensor` is the path the systemd unit in `packaging/` expects.
 
 ### With Nix (Linux or macOS)
 
@@ -129,8 +129,8 @@ variable is listed at the top of `esp32_plugin.py`, including
 (default `/tmp/vt-esp32-roles.json`) — the board-ownership files **shared**
 with the esp32-server plugin: keep both plugins' settings of them in sync.
 
-To keep it running: `packaging/systemd/trustthetest-esp32-sensor.service` (Linux,
-user unit) or `packaging/launchd/com.blackjackfruit.trustthetest-esp32-sensor.plist`
+To keep it running: `packaging/systemd/monkeytester-esp32-sensor.service` (Linux,
+user unit) or `packaging/launchd/com.blackjackfruit.monkeytester-esp32-sensor.plist`
 (macOS LaunchAgent). Run the esp32-server plugin's unit alongside it; the split
 happens by itself through the lock files and role cache.
 
@@ -145,17 +145,17 @@ reach the boards.
 
 ```bash
 # Install once
-cp packaging/systemd/trustthetest-esp32-sensor.service ~/.config/systemd/user/
-#   (edit WorkingDirectory if the checkout is not ~/Workspace/TrustTheTest-Esp32-Sensor)
+cp packaging/systemd/monkeytester-esp32-sensor.service ~/.config/systemd/user/
+#   (edit WorkingDirectory if the checkout is not ~/Workspace/MonkeyTester-Esp32-Sensor)
 systemctl --user daemon-reload
-systemctl --user enable --now trustthetest-esp32-sensor   # start now and at login
+systemctl --user enable --now monkeytester-esp32-sensor   # start now and at login
 
 # Day to day
-systemctl --user stop trustthetest-esp32-sensor      # frees the sensor ports
-systemctl --user start trustthetest-esp32-sensor
-systemctl --user restart trustthetest-esp32-sensor   # e.g. after pulling a new version
-systemctl --user status trustthetest-esp32-sensor
-journalctl --user -u trustthetest-esp32-sensor -f    # live log
+systemctl --user stop monkeytester-esp32-sensor      # frees the sensor ports
+systemctl --user start monkeytester-esp32-sensor
+systemctl --user restart monkeytester-esp32-sensor   # e.g. after pulling a new version
+systemctl --user status monkeytester-esp32-sensor
+journalctl --user -u monkeytester-esp32-sensor -f    # live log
 ```
 
 If the user manager's `PATH` has no `nix`, spell it out in `ExecStart` (e.g.
@@ -164,10 +164,10 @@ If the user manager's `PATH` has no `nix`, spell it out in `ExecStart` (e.g.
 **macOS (LaunchAgent):** replace `PYTHON` and `CHECKOUT_DIR` in the plist, then
 
 ```bash
-cp packaging/launchd/com.blackjackfruit.trustthetest-esp32-sensor.plist ~/Library/LaunchAgents/
-launchctl load -w ~/Library/LaunchAgents/com.blackjackfruit.trustthetest-esp32-sensor.plist    # start
-launchctl unload -w ~/Library/LaunchAgents/com.blackjackfruit.trustthetest-esp32-sensor.plist  # stop
-tail -f /tmp/trustthetest-esp32-sensor.log
+cp packaging/launchd/com.blackjackfruit.monkeytester-esp32-sensor.plist ~/Library/LaunchAgents/
+launchctl load -w ~/Library/LaunchAgents/com.blackjackfruit.monkeytester-esp32-sensor.plist    # start
+launchctl unload -w ~/Library/LaunchAgents/com.blackjackfruit.monkeytester-esp32-sensor.plist  # stop
+tail -f /tmp/monkeytester-esp32-sensor.log
 ```
 
 **In the foreground:** `nix run` (or `.venv/bin/python esp32_plugin.py`); stop it
@@ -187,7 +187,7 @@ curl -s -XPOST localhost:8091/jobs -H 'Content-Type: application/json' \
   -d '{"device":"sensor","action":"ble-advertise","params":{"seconds":0},"timeout_ms":60000}'
 ```
 
-### Pointing TrustTheTest at it
+### Pointing MonkeyTester at it
 
 ```bash
 VT_PLUGINS=esp32-sensor=http://<plugin-host>:8091,esp32-server=http://<plugin-host>:8093
@@ -225,7 +225,7 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
 - **flash** takes a prebuilt ESP-IDF build directory: anything with a
   `flasher_args.json` in it or in its `build/` subdirectory, such as the
   `result/` of `nix build .#firmware-c3-debug-test` in Esp32-Sensor. The
-  directory is a path on the plugin's host; when TrustTheTest runs elsewhere it
+  directory is a path on the plugin's host; when MonkeyTester runs elsewhere it
   can `POST /uploads` a zip of it and pass `upload:<id>` instead.
 - **expect** is a relay: the test's inline block goes to the board line by line
   as rules (`report`/`temp`/`wifi` directives on a sensor; HTTP response rules
