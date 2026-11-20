@@ -19,6 +19,12 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PLUGIN_PORT</key><string>8091</string>
+    <!-- The API listens on 127.0.0.1 by default. For LAN access set BOTH
+         PLUGIN_BIND and PLUGIN_TOKEN (>= 16 chars, e.g. `openssl rand -hex 32`);
+         without the token the plugin refuses to start. See SECURITY.md.
+    <key>PLUGIN_BIND</key><string>0.0.0.0</string>
+    <key>PLUGIN_TOKEN</key><string>TOKEN</string>
+    -->
     <key>PATH</key><string>CHECKOUT_DIR/.venv/bin:/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>

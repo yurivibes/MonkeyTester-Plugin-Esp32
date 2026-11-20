@@ -10,12 +10,15 @@ Standard library only.
 
 from __future__ import annotations
 
+import hmac
 import io
 import json
 import os
 import platform
 import shutil
 import socket
+import stat
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +30,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import security
+
 CONTRACT = "monkeytester-plugin"
 CONTRACT_VERSION = 1
 
@@ -35,7 +40,14 @@ JOB_RETENTION_S = 15 * 60
 JOB_LOG_LINES = 500
 MAX_WAIT_S = 60
 UPLOAD_TTL_S = 60 * 60
-MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024       # POST /uploads body (a zip)
+MAX_JSON_BYTES = 1024 * 1024              # every other request body
+MAX_UNZIPPED_BYTES = 256 * 1024 * 1024    # all files of one upload, unpacked
+MAX_UPLOAD_ENTRIES = 2000
+# Only what `flash` needs lands on disk: flasher_args.json and the images.
+UPLOAD_EXTENSIONS = (".bin", ".json")
+MAX_TIMEOUT_MS = 60 * 60 * 1000
+HANDLER_SOCKET_TIMEOUT_S = 30
 
 
 def now_ms() -> int:
@@ -358,6 +370,8 @@ class JobManager:
             timeout_ms = action.default_timeout_ms
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
             raise HttpError(400, "bad_request", "timeout_ms must be a positive integer")
+        if timeout_ms > MAX_TIMEOUT_MS:
+            raise HttpError(400, "bad_request", f"timeout_ms must be at most {MAX_TIMEOUT_MS}")
 
         device_id, device_obj = None, None
         if action.needs_device:
@@ -411,10 +425,17 @@ class JobManager:
         except JobCancelled:
             self._set_state(job, "cancelled", error={"code": "cancelled", "message": "cancelled"})
         except Exception as e:  # noqa: BLE001 - plugin bug, report not crash
-            self.append_log(job, traceback.format_exc().rstrip())
-            self._set_state(job, "error", error={"code": "internal", "message": repr(e)})
+            # The traceback goes to the plugin's own log, never to API clients.
+            print(f"job {job.id} ({job.action}) crashed:", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            self.append_log(job, "internal plugin error (details in the plugin's log)")
+            self._set_state(job, "error", error={
+                "code": "internal",
+                "message": f"internal plugin error ({type(e).__name__}); see the plugin's log"})
 
     def get(self, job_id: str, wait_s: float = 0.0) -> Job:
+        if not security.is_job_id(job_id):
+            raise HttpError(404, "not_found", "unknown job (ids look like j-<12 hex>)")
         end = time.monotonic() + max(0.0, min(wait_s, MAX_WAIT_S))
         with self._cond:
             job = self._jobs.get(job_id)
@@ -428,6 +449,8 @@ class JobManager:
             return job
 
     def cancel(self, job_id: str) -> Job:
+        if not security.is_job_id(job_id):
+            raise HttpError(404, "not_found", "unknown job (ids look like j-<12 hex>)")
         with self._cond:
             job = self._jobs.get(job_id)
             if job is None:
@@ -449,9 +472,24 @@ class JobManager:
 
 
 class Uploads:
+    """POST /uploads: a zip of a firmware build dir, unpacked under `root`.
+
+    Hardening: the body is capped (MAX_UPLOAD_BYTES, else 413), the unpacked
+    size and entry count are capped (zip bombs), entries with absolute paths,
+    `..`, NUL or symlink type are refused, every target is checked with
+    realpath + commonpath to stay under the upload's own dir, and only
+    UPLOAD_EXTENSIONS files are written (anything else in the zip is skipped).
+    The root is created 0700 and must be a real directory owned by this user."""
+
     def __init__(self, root: str | None = None):
         self.root = root or os.path.join(tempfile.gettempdir(), "vt-plugin-uploads")
-        os.makedirs(self.root, exist_ok=True)
+        os.makedirs(self.root, mode=0o700, exist_ok=True)
+        st = os.lstat(self.root)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"upload dir {self.root} is not a real directory")
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            raise RuntimeError(f"upload dir {self.root} belongs to another user; "
+                               "set PLUGIN_UPLOAD_DIR to a directory of your own")
         self._lock = threading.Lock()
 
     def _prune(self) -> None:
@@ -464,33 +502,65 @@ class Uploads:
             except OSError:
                 pass
 
+    @staticmethod
+    def _entry_name(info: zipfile.ZipInfo) -> str:
+        name = info.filename
+        if "\0" in name or name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
+            raise HttpError(400, "bad_request", f"zip entry has an absolute path: {name!r}")
+        if ".." in name.replace("\\", "/").split("/"):
+            raise HttpError(400, "bad_request", f"zip entry escapes the upload dir: {name!r}")
+        if stat.S_ISLNK(info.external_attr >> 16):
+            raise HttpError(400, "bad_request", f"zip entry is a symlink: {name!r}")
+        return name
+
     def store_zip(self, data: bytes) -> tuple[str, str]:
         with self._lock:
             self._prune()
         uid = uuid.uuid4().hex[:12]
         dest = os.path.join(self.root, uid)
-        os.makedirs(dest)
+        os.makedirs(dest, mode=0o700)
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                infos = zf.infolist()
+                if len(infos) > MAX_UPLOAD_ENTRIES:
+                    raise HttpError(413, "too_large",
+                                    f"zip has more than {MAX_UPLOAD_ENTRIES} entries")
                 base = os.path.realpath(dest)
-                for info in zf.infolist():
-                    target = os.path.realpath(os.path.join(dest, info.filename))
-                    if not (target == base or target.startswith(base + os.sep)):
+                total = 0
+                for info in infos:
+                    name = self._entry_name(info)
+                    target = os.path.realpath(os.path.join(dest, name))
+                    if os.path.commonpath([target, base]) != base:
                         raise HttpError(400, "bad_request",
-                                        f"zip entry escapes the upload dir: {info.filename}")
-                zf.extractall(dest)
-        except zipfile.BadZipFile:
+                                        f"zip entry escapes the upload dir: {name!r}")
+                    if info.is_dir() or not name.lower().endswith(UPLOAD_EXTENSIONS):
+                        continue  # directories come from the files; others are skipped
+                    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+                    # Count the bytes actually inflated: the sizes in the zip
+                    # headers are attacker-controlled.
+                    with zf.open(info) as src, open(target, "xb") as out:
+                        while True:
+                            chunk = src.read(1 << 16)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > MAX_UNZIPPED_BYTES:
+                                raise HttpError(413, "too_large",
+                                                f"zip unpacks to more than "
+                                                f"{MAX_UNZIPPED_BYTES} bytes")
+                            out.write(chunk)
+        except (zipfile.BadZipFile, zipfile.LargeZipFile, EOFError, NotImplementedError):
             shutil.rmtree(dest, ignore_errors=True)
-            raise HttpError(400, "bad_request", "body is not a zip archive") from None
-        except HttpError:
+            raise HttpError(400, "bad_request", "body is not a usable zip archive") from None
+        except (HttpError, OSError, RuntimeError):
             shutil.rmtree(dest, ignore_errors=True)
             raise
         return "upload:" + uid, dest
 
     def resolve(self, ref: str) -> str:
         uid = ref[len("upload:"):]
-        if not uid or not all(c in "0123456789abcdef" for c in uid):
-            raise HttpError(400, "bad_request", f"bad upload reference {ref!r}")
+        if not security.is_upload_id(uid):
+            raise HttpError(400, "bad_request", "bad upload reference (upload:<12 hex>)")
         p = os.path.join(self.root, uid)
         if not os.path.isdir(p):
             raise HttpError(400, "bad_request", f"upload {ref!r} doesn't exist (expired?)")
@@ -526,16 +596,29 @@ class Plugin:
     def resolve_path(self, value: str) -> str:
         if value.startswith("upload:"):
             return self.uploads.resolve(value)
-        return os.path.abspath(os.path.expanduser(value))
+        try:
+            return security.contained_path(value, os.getcwd(), [os.getcwd()])
+        except ValueError as e:
+            raise HttpError(400, "bad_request", str(e)) from None
 
 
 # ───────────────────────────── HTTP ─────────────────────────────
+
+
+def token_matches(expected: str | None, given: str | None) -> bool:
+    """Constant-time X-Plugin-Token check. No expected token: everything matches."""
+    if not expected:
+        return True
+    return hmac.compare_digest((given or "").encode("utf-8"), expected.encode("utf-8"))
 
 
 def make_handler(plugin: Plugin, jobs: JobManager, token: str | None):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"vt-plugin-{plugin.name}/{plugin.version}"
         protocol_version = "HTTP/1.1"
+        # Socket timeout per connection: a client that stops sending mid-request
+        # frees its thread. Long-poll waits and SSE don't read the socket.
+        timeout = HANDLER_SOCKET_TIMEOUT_S
 
         def log_message(self, fmt, *args):  # quieter default logging
             if os.environ.get("PLUGIN_ACCESS_LOG"):
@@ -551,40 +634,71 @@ def make_handler(plugin: Plugin, jobs: JobManager, token: str | None):
             self.wfile.write(body)
 
         def _error(self, e: HttpError) -> None:
+            if not self._body_done:
+                # An unread request body would be parsed as the next request on
+                # this keep-alive connection: answer, then close it.
+                self.close_connection = True
             self._send(e.status, {"error": str(e), "code": e.code})
 
+        def _authorized(self) -> bool:
+            return token_matches(token, self.headers.get("X-Plugin-Token"))
+
         def _auth(self) -> None:
-            if token and self.headers.get("X-Plugin-Token") != token:
+            if not self._authorized():
                 raise HttpError(401, "unauthorized", "missing or wrong X-Plugin-Token")
 
-        def _body(self) -> bytes:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_UPLOAD_BYTES:
-                raise HttpError(400, "bad_request", "body too large")
-            return self.rfile.read(n) if n else b""
+        def _body(self, limit: int = MAX_JSON_BYTES) -> bytes:
+            """The request body: Content-Length required for a body (no chunked
+            encoding), capped at `limit` (413 above it), bad lengths are 400."""
+            if self.headers.get("Transfer-Encoding"):
+                raise HttpError(411, "length_required",
+                                "send a Content-Length (chunked bodies are not accepted)")
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None or raw_len.strip() == "":
+                self._body_done = True
+                return b""
+            try:
+                n = int(raw_len.strip())
+            except ValueError:
+                raise HttpError(400, "bad_request", "bad Content-Length") from None
+            if n < 0:
+                raise HttpError(400, "bad_request", "bad Content-Length")
+            if n > limit:
+                raise HttpError(413, "too_large", f"body too large (max {limit} bytes)")
+            data = self.rfile.read(n) if n else b""
+            self._body_done = True
+            if len(data) != n:
+                raise HttpError(400, "bad_request", "body shorter than its Content-Length")
+            return data
 
         def _json_body(self):
-            raw = self._body()
+            raw = self._body(MAX_JSON_BYTES)
             try:
                 return json.loads(raw or b"{}")
-            except json.JSONDecodeError as e:
-                raise HttpError(400, "bad_request", f"invalid JSON: {e}") from None
+            except (ValueError, RecursionError):  # JSONDecodeError, bad UTF-8, deep nesting
+                raise HttpError(400, "bad_request", "body is not valid JSON") from None
 
         def _dispatch(self, method: str) -> None:
+            raw_len = (self.headers.get("Content-Length") or "").strip()
+            self._body_done = raw_len in ("", "0") and not self.headers.get("Transfer-Encoding")
             try:
-                self._auth()
                 url = urlparse(self.path)
                 parts = [p for p in url.path.split("/") if p]
+                # /health is open (the viewer's liveness check); everything else
+                # needs the token when one is configured.
+                if not (method == "GET" and parts == ["health"]):
+                    self._auth()
                 query = {k: v[-1] for k, v in parse_qs(url.query).items()}
                 self._route(method, parts, query)
             except HttpError as e:
                 self._error(e)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            except Exception as e:  # noqa: BLE001
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                self.close_connection = True
+            except Exception:  # noqa: BLE001 - details to the log, not the client
                 traceback.print_exc()
                 try:
-                    self._error(HttpError(500, "internal", repr(e)))
+                    self._error(HttpError(500, "internal",
+                                          "internal plugin error; see the plugin's log"))
                 except OSError:
                     pass
 
@@ -597,17 +711,23 @@ def make_handler(plugin: Plugin, jobs: JobManager, token: str | None):
         # -- routes --
         def _route(self, method, parts, query):
             if method == "GET" and parts == ["health"]:
+                # Unauthenticated: contract, plugin name/version, device count and
+                # the device error. Never the token, env or file paths; the host
+                # name only to authenticated callers.
                 devs = plugin.devices()
-                return self._send(200, {
+                body = {
                     "ok": plugin.device_error() is None,
                     "contract": CONTRACT,
                     "contract_version": CONTRACT_VERSION,
                     "plugin": {"name": plugin.name, "version": plugin.version},
-                    "host": {"os": platform.system().lower(), "hostname": socket.gethostname()},
                     "devices": len(devs),
                     "capabilities": list(plugin.capabilities),
                     "error": plugin.device_error(),
-                })
+                }
+                if self._authorized():
+                    body["host"] = {"os": platform.system().lower(),
+                                    "hostname": socket.gethostname()}
+                return self._send(200, body)
             if method == "GET" and parts == ["devices"]:
                 return self._send(200, {"devices": plugin.devices(),
                                         "error": plugin.device_error()})
@@ -632,7 +752,9 @@ def make_handler(plugin: Plugin, jobs: JobManager, token: str | None):
             if method == "GET" and parts == ["events"] and "events" in plugin.capabilities:
                 return self._events(query)
             if method == "POST" and parts == ["uploads"] and "uploads" in plugin.capabilities:
-                ref, path = plugin.uploads.store_zip(self._body())
+                if self.headers.get("Content-Length") is None:
+                    raise HttpError(411, "length_required", "POST /uploads needs a Content-Length")
+                ref, path = plugin.uploads.store_zip(self._body(MAX_UPLOAD_BYTES))
                 return self._send(201, {"upload": ref, "path": path})
             raise HttpError(404, "not_found", f"no route for {method} {self.path}")
 
@@ -662,11 +784,21 @@ def make_handler(plugin: Plugin, jobs: JobManager, token: str | None):
 
 
 class PluginServer:
-    def __init__(self, plugin: Plugin, host: str = "0.0.0.0", port: int = 0,
+    """The HTTP server. Refuses (ValueError) a non-loopback `host` without a
+    token, the same rule main() enforces at startup (security.bind_policy_error)."""
+
+    def __init__(self, plugin: Plugin, host: str = security.DEFAULT_BIND, port: int = 0,
                  token: str | None = None):
+        err = security.bind_policy_error(host, token)
+        if err:
+            raise ValueError(err)
         self.plugin = plugin
         self.jobs = JobManager(plugin, plugin.events)
-        self.httpd = ThreadingHTTPServer((host, port), make_handler(plugin, self.jobs, token))
+        server_cls = ThreadingHTTPServer
+        if ":" in host:  # an IPv6 literal such as ::1
+            server_cls = type("ThreadingHTTPServer6", (ThreadingHTTPServer,),
+                              {"address_family": socket.AF_INET6})
+        self.httpd = server_cls((host.strip("[]"), port), make_handler(plugin, self.jobs, token))
         self.httpd.daemon_threads = True
 
     @property

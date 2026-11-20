@@ -58,7 +58,7 @@ there is nothing else to install:
 
 ```bash
 nix run .#tests            # unit tests against fake boards
-nix run                    # the plugin on 0.0.0.0:8091
+nix run                    # the plugin on 127.0.0.1:8091 (loopback only)
 nix develop                # a shell with python3 + the packages + esptool
 ```
 
@@ -110,7 +110,7 @@ plugin (below) and check `curl -s localhost:8091/health`.
 Install the dependencies first (see [Install](#install)), then:
 
 ```bash
-nix run                          # plugin on 0.0.0.0:8091
+nix run                          # plugin on 127.0.0.1:8091 (loopback only)
 .venv/bin/python esp32_plugin.py # the same, without Nix
 ```
 
@@ -128,6 +128,33 @@ variable is listed at the top of `esp32_plugin.py`, including
 `ESP32_LOCK_DIR` (default `/tmp/vt-esp32-locks`) and `ESP32_ROLE_CACHE`
 (default `/tmp/vt-esp32-roles.json`) — the board-ownership files **shared**
 with the esp32-server plugin: keep both plugins' settings of them in sync.
+
+### Network access and the token
+
+The plugin API listens on **127.0.0.1 only** by default (`PLUGIN_BIND`), which is
+all the viewer needs when it runs on the same host (it reaches the plugin at
+`http://127.0.0.1:8091`). The sibling esp32-server plugin has the same defaults.
+
+To reach the plugin from another machine, bind it to a LAN address **and** set a
+token, or it refuses to start (exit code 2, with the reason on stderr):
+
+```bash
+export PLUGIN_TOKEN=$(openssl rand -hex 32)    # at least 16 characters
+PLUGIN_BIND=0.0.0.0 PLUGIN_TOKEN=$PLUGIN_TOKEN nix run
+curl -s -H "X-Plugin-Token: $PLUGIN_TOKEN" http://<plugin-host>:8091/devices
+```
+
+With a token set, every request except `GET /health` needs the
+`X-Plugin-Token` header (401 otherwise); on loopback the token is optional and,
+when set, enforced the same way. The viewer keeps each plugin's token in
+**Settings → Device Plugins** (MonkeyTester PR in progress; until it lands, the
+viewer's `PLUGIN_TOKEN` / `VT_PLUGIN_TOKEN_<NAME>` environment). There is no
+TLS: use a VPN or Tailscale to reach the plugin across untrusted networks.
+
+`flash` only reads firmware from `ESP32_FIRMWARE_ROOT` (default: the working
+directory), any extra directory listed in `ESP32_FIRMWARE_ROOTS`
+(`:`-separated), the upload directory and `/nix/store`; other paths, `..` and
+symlinks out of those roots are refused. Details and limits: [SECURITY.md](SECURITY.md).
 
 To keep it running: `packaging/systemd/monkeytester-esp32-sensor.service` (Linux,
 user unit) or `packaging/launchd/com.blackjackfruit.monkeytester-esp32-sensor.plist`
@@ -193,6 +220,9 @@ curl -s -XPOST localhost:8091/jobs -H 'Content-Type: application/json' \
 VT_PLUGINS=esp32-sensor=http://<plugin-host>:8091,esp32-server=http://<plugin-host>:8093
 ```
 
+(`<plugin-host>` is `127.0.0.1` when the viewer runs on the same host, which is
+the default setup; anything else needs `PLUGIN_BIND` + `PLUGIN_TOKEN` as above.)
+
 and, in a test (sensor steps hit this plugin; hub/server steps hit the
 other one):
 
@@ -225,8 +255,10 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
 - **flash** takes a prebuilt ESP-IDF build directory: anything with a
   `flasher_args.json` in it or in its `build/` subdirectory, such as the
   `result/` of `nix build .#firmware-c3-debug-test` in Esp32-Sensor. The
-  directory is a path on the plugin's host; when MonkeyTester runs elsewhere it
-  can `POST /uploads` a zip of it and pass `upload:<id>` instead.
+  directory is a path on the plugin's host under one of the allowed firmware
+  roots (see [Network access and the token](#network-access-and-the-token));
+  when MonkeyTester runs elsewhere it can `POST /uploads` a zip of it and pass
+  `upload:<id>` instead (only `.bin` and `.json` files are unpacked).
 - **expect** is a relay: the test's inline block goes to the board line by line
   as rules (`report`/`temp`/`wifi` directives on a sensor; HTTP response rules
   belong to the esp32-server plugin). A block states only what changes; earlier
@@ -248,6 +280,7 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 | File | What |
 |---|---|
 | `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads. No ESP32 code. |
+| `security.py` | Bind/token policy and request-input validators (MAC, serial port, job/upload ids, contained paths); identical in both ESP32 plugin repos. See [SECURITY.md](SECURITY.md). |
 | `esp32_plugin.py` | Board discovery, role ownership, actions, flashing, `main()` |
 | `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, VT control requests, reset |
 | `tests/` | Contract and action tests with a fake board (`fake_board.py`: pre-role and sensor firmware, and a fake USJ port whose node index moves after the fake esptool resets), a fake esptool, and `test_ownership.py` for the board/role split against esp32-server |
