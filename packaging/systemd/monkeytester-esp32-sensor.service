@@ -1,18 +1,18 @@
 # User unit (Linux), esp32-sensor plugin: owns the `role: sensor` boards.
 # Install:
-#   cp packaging/systemd/trustthetest-esp32-sensor.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload && systemctl --user enable --now trustthetest-esp32-sensor
+#   cp packaging/systemd/monkeytester-esp32-sensor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now monkeytester-esp32-sensor
 # Edit WorkingDirectory to this checkout. The user must be in the `dialout`
 # group. Run the esp32-server unit alongside this one; the two plugins split
 # the boards by role and share the console locks (ESP32_LOCK_DIR, default
 # /tmp/vt-esp32-locks) and the role cache (ESP32_ROLE_CACHE, default
 # /tmp/vt-esp32-roles.json).
 [Unit]
-Description=TrustTheTest esp32-sensor device plugin (:8091)
+Description=MonkeyTester esp32-sensor device plugin (:8091)
 After=network-online.target
 
 [Service]
-WorkingDirectory=%h/Workspace/TrustTheTest-Esp32-Sensor
+WorkingDirectory=%h/Workspace/MonkeyTester-Esp32-Sensor
 ExecStart=/usr/bin/env nix run .
 Restart=on-failure
 RestartSec=5
