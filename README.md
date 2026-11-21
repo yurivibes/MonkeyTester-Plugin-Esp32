@@ -1,14 +1,14 @@
-# MonkeyTester-Esp32-Sensor
+# MonkeyTester-Plugin-Esp32-Sensor
 
 The `esp32-sensor` device plugin for
-[MonkeyTester](http://192.168.125.70:3000/yurivibes/MonkeyTester). It owns
+[MonkeyTester](https://github.com/yurivibes/MonkeyTester). It owns
 the **`role: sensor`** ESP32 boards plugged into its host, flashes prebuilt
 firmware onto them, and relays a test's expectations (how the board should
 answer the app: a broken sensor reading, an HTTP error, a hang, going offline,
 …) to the board.
 
 Hub/server boards and the fake software server are **not here**: they belong to
-the sibling plugin [MonkeyTester-Esp32-Server](http://192.168.125.70:3000/yurivibes/MonkeyTester-Esp32-Server)
+the sibling plugin [MonkeyTester-Plugin-Esp32-Server](https://github.com/yurivibes/MonkeyTester-Plugin-Server)
 (`esp32-server`, on :8093). The two plugins discover the same nodes but split
 them by role: each probes a board's firmware `status`, keeps only its own role,
 and shares the boards through per-node console locks and a role cache, so two
@@ -44,7 +44,7 @@ console lock so esp32-server can adopt it.
 | Membership of the `dialout` group | opening `/dev/ttyUSB*` / `/dev/ttyACM*` | on Linux |
 
 ```bash
-git clone http://192.168.125.70:3000/yurivibes/MonkeyTester-Esp32-Sensor.git ~/Workspace/MonkeyTester-Esp32-Sensor
+git clone https://github.com/yurivibes/MonkeyTester-Plugin-Esp32.git ~/Workspace/MonkeyTester-Esp32-Sensor
 cd ~/Workspace/MonkeyTester-Esp32-Sensor
 ```
 

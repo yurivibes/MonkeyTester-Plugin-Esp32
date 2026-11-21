@@ -50,7 +50,7 @@ MAC to the new node — `details.port` changes, its id and events don't. The
 ## The fake server — not here
 
 The software server (hub HTTP API on :8092, registry/history, rule language,
-mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Esp32-Server** plugin
+mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Plugin-Esp32-Server** plugin
 with its full documentation (`esp32-server` on :8093). Tests don't change
 between the fake and a real hub board; they run against the esp32-server
 plugin either way.

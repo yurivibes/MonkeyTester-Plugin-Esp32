@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""MonkeyTester-Esp32-Sensor: the `esp32-sensor` device plugin for MonkeyTester.
+"""MonkeyTester-Plugin-Esp32-Sensor: the `esp32-sensor` device plugin for MonkeyTester.
 
 Owns the `role: sensor` ESP32 boards plugged into this host (Linux or macOS)
 and exposes them through the MonkeyTester Device Plugin API (PLUGIN_API.md in
 the MonkeyTester repo; generic part in plugin_server.py); actions are listed
 in ACTIONS.md. The `role: hub` boards (the project's "server" boards) belong to
-the sibling esp32-server plugin (MonkeyTester-Esp32-Server), never to this one:
+the sibling esp32-server plugin (MonkeyTester-Plugin-Esp32-Server), never to this one:
 a node that answers `status` with the other role is probed, dropped and its
 console lock released, so the other plugin adopts it; the shared role cache
 lets this plugin skip such a node without touching it again.
