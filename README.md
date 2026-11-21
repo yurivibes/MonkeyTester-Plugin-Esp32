@@ -1,4 +1,4 @@
-# MonkeyTester-Plugin-Esp32-Sensor
+# MonkeyTester-Plugin-Esp32
 
 The `esp32-sensor` device plugin for
 [MonkeyTester](https://github.com/yurivibes/MonkeyTester). It owns
@@ -8,7 +8,7 @@ answer the app: a broken sensor reading, an HTTP error, a hang, going offline,
 …) to the board.
 
 Hub/server boards and the fake software server are **not here**: they belong to
-the sibling plugin [MonkeyTester-Plugin-Esp32-Server](https://github.com/yurivibes/MonkeyTester-Plugin-Server)
+the sibling plugin [MonkeyTester-Plugin-Server](https://github.com/yurivibes/MonkeyTester-Plugin-Server)
 (`esp32-server`, on :8093). The two plugins discover the same nodes but split
 them by role: each probes a board's firmware `status`, keeps only its own role,
 and shares the boards through per-node console locks and a role cache, so two
@@ -17,7 +17,7 @@ plugin processes never open the same serial console.
 MonkeyTester reaches it only through the shared **Device Plugin API**
 (`PLUGIN_API.md` in the MonkeyTester repo). Boards are driven over their serial
 console with the **VT control protocol** (`docs/vt-control.md` in
-[Esp32-Sensor](http://192.168.125.70:3000/yurivibes/Esp32-Sensor)),
+the sensor firmware),
 which that firmware's `…-test` builds include.
 
 ```
@@ -28,7 +28,7 @@ MonkeyTester ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or ma
 ```
 
 A board's **role** (`sensor` or `hub`, from its firmware's status; see
-`docs/hub-protocol.md` in Esp32-Server) decides which plugin owns it.
+`docs/hub-protocol.md` in the server firmware) decides which plugin owns it.
 Here, `device=sensor` (the default) or `device=<mac>`; `device=hub`/`server` is
 answered with `wrong_plugin` — run the step against the esp32-server plugin
 instead. When this plugin finds a hub board it drops it and releases its
@@ -254,7 +254,7 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
   moved (esptool's hard reset on a native port) keeps its MAC and moves with it.
 - **flash** takes a prebuilt ESP-IDF build directory: anything with a
   `flasher_args.json` in it or in its `build/` subdirectory, such as the
-  `result/` of `nix build .#firmware-c3-debug-test` in Esp32-Sensor. The
+  `result/` of `nix build .#firmware-c3-debug-test` in the sensor firmware. The
   directory is a path on the plugin's host under one of the allowed firmware
   roots (see [Network access and the token](#network-access-and-the-token));
   when MonkeyTester runs elsewhere it can `POST /uploads` a zip of it and pass

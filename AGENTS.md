@@ -1,10 +1,10 @@
-# MonkeyTester-Plugin-Esp32-Sensor — Agent Guide
+# MonkeyTester-Plugin-Esp32 — Agent Guide
 
 ## Purpose
 The `esp32-sensor` device plugin for MonkeyTester: flashes prebuilt firmware
 onto the **sensor** ESP32 boards and drives them over the VT control serial
 protocol, behind the shared Device Plugin API. Hub/server boards and the fake
-software server are the sibling plugin's (MonkeyTester-Plugin-Esp32-Server, `esp32-server`,
+software server are the sibling plugin's (MonkeyTester-Plugin-Server, `esp32-server`,
 :8093). See README.md.
 
 ## Setup (do this first)
@@ -28,8 +28,8 @@ anything; that section is the single source for them. In short:
   job states or fields here without changing that document first (and bumping
   `contract_version` for breaking changes).
 - **The device protocol is owned by the firmware.** Board commands and the rule
-  language follow `docs/vt-control.md` in Esp32-Sensor and
-  `docs/hub-protocol.md` in Esp32-Server (roles, hub API, sections 6-7).
+  language follow `docs/vt-control.md` in the sensor firmware and
+  `docs/hub-protocol.md` in the server firmware (roles, hub API, sections 6-7).
   For boards, `expect` relays rule lines without interpreting them; don't add
   parsing or validation of board rules here.
 - **Sensor boards only.** A node whose firmware `status` answers `role: hub` is

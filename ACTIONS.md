@@ -6,7 +6,7 @@ parameter schemas.
 
 ## Devices and roles
 
-This plugin owns the **`role: sensor`** boards only (Esp32-Server
+This plugin owns the **`role: sensor`** boards only (the server firmware's
 `docs/hub-protocol.md` sections 6 and 7 name the roles; the project calls the
 `role: hub` boards "server"). Each board's `status` / `@vt - ready` line says
 `"role":"sensor"` or `"role":"hub"`; firmware from before roles (no `role`
@@ -50,7 +50,7 @@ MAC to the new node — `details.port` changes, its id and events don't. The
 ## The fake server — not here
 
 The software server (hub HTTP API on :8092, registry/history, rule language,
-mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Plugin-Esp32-Server** plugin
+mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Plugin-Server** plugin
 with its full documentation (`esp32-server` on :8093). Tests don't change
 between the fake and a real hub board; they run against the esp32-server
 plugin either way.
@@ -128,7 +128,7 @@ END
 
 For a board, the plugin doesn't interpret the rules. It drops blank and `#`
 lines and sends each line as `rule <line>` over the VT control protocol, nothing
-else. The rule language belongs to the firmware: `docs/vt-control.md` in Esp32-Sensor
+else. The rule language belongs to the firmware: `docs/vt-control.md` in the sensor firmware
 (HTTP responses with a status and body, `hang`, `delay`, `sequence` for a
 reading whose temperature moves on with each request, `normal` to undo one
 rule, and `wifi`/`mqtt` directives). A later rule for the same method and path
