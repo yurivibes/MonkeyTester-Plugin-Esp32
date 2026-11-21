@@ -24,7 +24,7 @@ ExecStart=/usr/bin/env nix run .
 #Environment=PLUGIN_TOKEN=<openssl rand -hex 32>
 # Extra directories `flash` may read firmware from (default: this checkout,
 # the upload dir and /nix/store):
-#Environment=ESP32_FIRMWARE_ROOTS=%h/Workspace/Esp32-Sensor
+#Environment=ESP32_FIRMWARE_ROOTS=%h/Workspace/sensor-firmware
 Restart=on-failure
 RestartSec=5
 
