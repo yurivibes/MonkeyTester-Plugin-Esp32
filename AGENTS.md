@@ -1,10 +1,10 @@
-# MonkeyTester-Esp32-Sensor — Agent Guide
+# MonkeyTester-Plugin-Esp32-Sensor — Agent Guide
 
 ## Purpose
 The `esp32-sensor` device plugin for MonkeyTester: flashes prebuilt firmware
 onto the **sensor** ESP32 boards and drives them over the VT control serial
 protocol, behind the shared Device Plugin API. Hub/server boards and the fake
-software server are the sibling plugin's (MonkeyTester-Esp32-Server, `esp32-server`,
+software server are the sibling plugin's (MonkeyTester-Plugin-Esp32-Server, `esp32-server`,
 :8093). See README.md.
 
 ## Setup (do this first)

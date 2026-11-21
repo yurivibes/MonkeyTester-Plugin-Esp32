@@ -1,5 +1,5 @@
 {
-  description = "MonkeyTester-Esp32-Sensor: MonkeyTester device plugin for the ESP32 sensor boards";
+  description = "MonkeyTester-Plugin-Esp32-Sensor: MonkeyTester device plugin for the ESP32 sensor boards";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
