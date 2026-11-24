@@ -117,6 +117,6 @@ directory.
 
 ## Reporting a problem
 
-This is a single-user home-lab project. Open an issue on the GitHub repo
-(`https://github.com/yurivibes/MonkeyTester-Plugin-Esp32/issues`) or tell the maintainer directly; don't
+This is a single-user home-lab project. Open an issue in this repository's issue tracker
+or tell the maintainer directly; don't
 post working tokens in the issue.
