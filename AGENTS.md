@@ -81,3 +81,23 @@ open a real port: tests pin `ESP32_PORTS`/`_candidate_ports` to fake nodes.
 `test_ownership.py` covers the split: a hub-role node gets probed, dropped, its
 lock freed and its role cached (the flock primitives are simulated there — one
 process stands in for two).
+
+## Hosting and review workflow
+This repo isn't tied to one code host: it can live on GitHub, Gitea/Forgejo, GitLab, Bitbucket or a
+mirror. Find the host from the remote you were asked to work against (`git remote -v`, usually
+`origin`) and use that host's tools; the docs never assume one.
+
+| Remote host | Review is called | CLI |
+|---|---|---|
+| github.com or GitHub Enterprise | pull request | `gh pr create` |
+| Gitea / Forgejo | pull request | `tea pr create` |
+| GitLab | merge request | `glab mr create` |
+| Bitbucket | pull request | web UI or REST API |
+
+- `master` changes only through a reviewed PR/MR that a maintainer merges. Never push to `master`
+  and never merge your own PR/MR.
+- Work on a feature branch in its own git worktree, based on the remote's `master`.
+- There is no hosted CI. Run `nix run .#tests` (or the `python3 -m unittest` line in Tests) before opening the PR/MR.
+- In docs, name sibling repos (e.g. MonkeyTester-Plugin-AI) instead of linking a host URL, link
+  files in this repo with relative paths, and stick to CommonMark plus GFM tables and code
+  fences (no host-only syntax such as `> [!NOTE]` callouts or `#123` autolinks).
