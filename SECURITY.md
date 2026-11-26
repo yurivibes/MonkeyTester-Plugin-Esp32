@@ -1,6 +1,6 @@
 # Security — MonkeyTester-Plugin-Esp32
 
-This is the `esp32-sensor` device plugin for MonkeyTester. This page says what it
+This is the `ESP32-SENSOR` device plugin for MonkeyTester. This page says what it
 protects, how, and what it does not. It makes **no "zero vulnerabilities"
 claim**: it closes the known holes and keeps the attack surface small for its
 intended setting.
@@ -27,7 +27,7 @@ intended setting.
 **The defaults are identical in MonkeyTester-Plugin-Esp32 and
 MonkeyTester-Plugin-Server** (same `PLUGIN_BIND` default, same token rule, same
 limits; `security.py` and `plugin_server.py` are byte-identical in both repos).
-The sibling plugin is MonkeyTester-Plugin-Server (`esp32-server`, :8093).
+The sibling plugin is MonkeyTester-Plugin-Server (`ESP32-SERVER`, :8093).
 
 ## Token setup
 

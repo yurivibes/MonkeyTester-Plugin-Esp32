@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""MonkeyTester-Plugin-Esp32: the `esp32-sensor` device plugin for MonkeyTester.
+"""MonkeyTester-Plugin-Esp32: the `ESP32-SENSOR` device plugin for MonkeyTester.
 
 Owns the `role: sensor` ESP32 boards plugged into this host (Linux or macOS)
 and exposes them through the MonkeyTester Device Plugin API (PLUGIN_API.md in
 the MonkeyTester repo; generic part in plugin_server.py); actions are listed
 in ACTIONS.md. The `role: hub` boards (the project's "server" boards) belong to
-the sibling esp32-server plugin (MonkeyTester-Plugin-Server), never to this one:
+the sibling ESP32-SERVER plugin (MonkeyTester-Plugin-Server), never to this one:
 a node that answers `status` with the other role is probed, dropped and its
 console lock released, so the other plugin adopts it; the shared role cache
 lets this plugin skip such a node without touching it again.
@@ -38,9 +38,9 @@ Environment:
                      the upload dir and /nix/store is refused
   ESP32_READY_TIMEOUT_S  how long to wait for `@mt - ready` after boot (default 20)
   PLUGIN_UPLOAD_DIR  where POST /uploads unpacks zips (default: <tmp>/mt-plugin-uploads)
-  ESP32_LOCK_DIR     per-node lock files shared with the esp32-server plugin
+  ESP32_LOCK_DIR     per-node lock files shared with the ESP32-SERVER plugin
                      (default /tmp/mt-esp32-locks)
-  ESP32_ROLE_CACHE   JSON file {board key -> role} shared with the esp32-server
+  ESP32_ROLE_CACHE   JSON file {board key -> role} shared with the ESP32-SERVER
                      plugin (default /tmp/mt-esp32-roles.json)
 """
 
@@ -83,12 +83,12 @@ USJ_REAPPEAR_S = float(os.environ.get("ESP32_USJ_REAPPEAR_S", "10"))
 _MAC_IN_NAME = re.compile(r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}")
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 
-PLUGIN_NAME = "esp32-sensor"
+PLUGIN_NAME = "ESP32-SENSOR"
 PLUGIN_DEFAULT_PORT = 8091
 # The board roles this plugin owns. The project calls the hub board "server";
 # the firmware's status field still says `hub`, which stays the wire value and
 # `server` is only a `device=` alias. Those boards belong to the sibling
-# esp32-server plugin, never to this one.
+# ESP32-SERVER plugin, never to this one.
 OWNED_BOARD_ROLES = ("sensor",)
 OTHER_BOARD_ROLES = ("hub", "server")
 # Fixed /tmp paths on purpose: they are the cross-process protocol with the
@@ -357,8 +357,8 @@ def run_tool(ctx: JobContext, argv: list) -> tuple[int, str]:
 
 
 class Esp32Plugin(Plugin):
-    """The `esp32-sensor` plugin: owns the `role: sensor` boards. The `role:
-    hub` boards ("server" boards) belong to the sibling esp32-server plugin."""
+    """The `ESP32-SENSOR` plugin: owns the `role: sensor` boards. The `role:
+    hub` boards ("server" boards) belong to the sibling ESP32-SERVER plugin."""
     name = PLUGIN_NAME
     version = VERSION
     capabilities = ["events", "uploads"]
@@ -378,7 +378,7 @@ class Esp32Plugin(Plugin):
         self._lock = threading.Lock()
         self._error = None
         self.jobs = None  # set by main() / tests, to report `busy`
-        # Cross-process board ownership: the esp32-server plugin must never
+        # Cross-process board ownership: the ESP32-SERVER plugin must never
         # open this plugin's boards' consoles (two reader threads on one tty
         # shred each other's bytes). A per-node flock says which plugin has a
         # console; the role cache lets either plugin skip a node whose role
@@ -492,7 +492,7 @@ class Esp32Plugin(Plugin):
         else:
             owned = True  # a board that never answers MT control counts as a sensor
         if not owned:
-            # Not our board: give the console back; esp32-server adopts it
+            # Not our board: give the console back; ESP32-SERVER adopts it
             # on its next rescan.
             b.stop()
             self._drop_lock(b.port)
@@ -541,7 +541,7 @@ class Esp32Plugin(Plugin):
             return b
         return None
 
-    # ── cross-process board ownership (shared with esp32-server) ─
+    # ── cross-process board ownership (shared with ESP32-SERVER) ─
 
     def _owns(self, role: str) -> bool:
         return role in OWNED_BOARD_ROLES
@@ -695,7 +695,7 @@ class Esp32Plugin(Plugin):
     def resolve_device(self, ref):
         """`device=` is a MAC (or serial port), `sensor` or omitted: this
         plugin only owns sensor boards; hub/server boards are the
-        esp32-server plugin's."""
+        ESP32-SERVER plugin's."""
         try:
             ref = security.check_device_ref(ref, [b.port for b in self.boards()])
         except ValueError as e:
@@ -706,7 +706,7 @@ class Esp32Plugin(Plugin):
         if ref in ("hub", "server"):
             raise HttpError(404, "wrong_plugin",
                             "hub/server boards and the fake server belong to "
-                            "the esp32-server plugin; this plugin only owns "
+                            "the ESP32-SERVER plugin; this plugin only owns "
                             "sensor boards")
         for b in self.boards():
             if ref in (b.id, b.mac, b.port) or os.path.realpath(str(ref)) == os.path.realpath(b.port):
@@ -796,7 +796,7 @@ class Esp32Plugin(Plugin):
                    "changes; `<METHOD> <path> -> normal` undoes one rule, `clear` undoes all). "
                    "The rule language is the firmware's (sensor firmware "
                    "docs/mt-control.md, hub-protocol.md section 6): HTTP rules go to "
-                   "the esp32-server plugin (device=hub there), `report`/`temp`/`wifi` "
+                   "the ESP32-SERVER plugin (device=hub there), `report`/`temp`/`wifi` "
                    "directives to the sensor. Blank and # lines are skipped. Stops at the "
                    "first line the device rejects.",
                    self.act_expect,
@@ -806,7 +806,7 @@ class Esp32Plugin(Plugin):
             Action("clear", "Drop every expectation: the board behaves normally again.",
                    self.act_clear, default_timeout_ms=10_000),
         ]
-        # Sensor-only: hub/server actions (`forget`) live in the esp32-server
+        # Sensor-only: hub/server actions (`forget`) live in the ESP32-SERVER
         # plugin, and every device here is a sensor, so no action filtering.
         return {a.name: a for a in acts}
 

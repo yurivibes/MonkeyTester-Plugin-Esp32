@@ -64,7 +64,7 @@ class DocsTests(unittest.TestCase):
         page = body.decode("utf-8")
         self.assertTrue(page.startswith("<!DOCTYPE html>"))
         self.assertIn(">" + first_h1(ps.README_PATH) + "</h1>", page)
-        self.assertIn("<title>esp32-sensor documentation</title>", page)
+        self.assertIn("<title>ESP32-SENSOR documentation</title>", page)
         self.assertNotIn("<script", page)
 
     def test_health_advertises_docs(self):

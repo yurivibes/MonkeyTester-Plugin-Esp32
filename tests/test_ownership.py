@@ -1,6 +1,6 @@
-"""Board roles and cross-plugin ownership for the esp32-sensor plugin.
+"""Board roles and cross-plugin ownership for the ESP32-SENSOR plugin.
 
-The hub/server boards and the fake server belong to the esp32-server plugin.
+The hub/server boards and the fake server belong to the ESP32-SERVER plugin.
 This plugin probes every node, drops a board that answers `status` with the
 other role and releases its console lock so the other plugin can adopt it;
 the shared role cache keeps a later scan from touching that node again.
@@ -101,7 +101,7 @@ class OwnershipTests(unittest.TestCase):
                 self.assertEqual({x["id"]: x["details"]["role"] for x in d["devices"]},
                                  {SENSOR: "sensor"})
                 # It took the hub board's node, probed it, dropped it: the node
-                # is free for esp32-server and its role is in the cache under
+                # is free for ESP32-SERVER and its role is in the cache under
                 # both the node path and the MAC.
                 self.assertNotIn("/dev/fake1", holder)
                 self.assertEqual(cache_read_role(cache, "/dev/fake1"), "hub")

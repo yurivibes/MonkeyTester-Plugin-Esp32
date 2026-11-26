@@ -1,4 +1,4 @@
-# esp32-sensor plugin actions
+# ESP32-SENSOR plugin actions
 
 Every action runs as a job (`POST /jobs`, then `GET /jobs/<id>?wait=…`; see
 `PLUGIN_API.md` in MonkeyTester). `GET /actions` returns the same list with full
@@ -12,7 +12,7 @@ This plugin owns the **`role: sensor`** boards only (the server firmware's
 `"role":"sensor"` or `"role":"hub"`; firmware from before roles (no `role`
 field), and boards that don't answer MT control, count as sensors. A node that
 answers with the other role is probed, dropped and its console lock released so
-the esp32-server plugin adopts it; the shared role cache keeps the next scan
+the ESP32-SERVER plugin adopts it; the shared role cache keeps the next scan
 from touching it.
 
 `device=` in a test step (the job's `device`) is one of:
@@ -20,7 +20,7 @@ from touching it.
 | Value | Resolves to |
 |---|---|
 | omitted, or `sensor` | The one attached sensor board. Fails (`unknown_device`, 404) when none is attached, and (`bad_request`, 400) when there are several: then pass the MAC |
-| `hub` or `server` | `wrong_plugin` (404): hub/server boards and the fake server belong to the esp32-server plugin |
+| `hub` or `server` | `wrong_plugin` (404): hub/server boards and the fake server belong to the ESP32-SERVER plugin |
 | a MAC, or a serial port | That board, when this plugin owns it |
 
 `GET /devices` lists every owned board with `details.role`, `details.port` (the
@@ -51,8 +51,8 @@ MAC to the new node — `details.port` changes, its id and events don't. The
 
 The software server (hub HTTP API on :8092, registry/history, rule language,
 mDNS `tshub-fake`) lives in the sibling **MonkeyTester-Plugin-Server** plugin
-with its full documentation (`esp32-server` on :8093). Tests don't change
-between the fake and a real hub board; they run against the esp32-server
+with its full documentation (`ESP32-SERVER` on :8093). Tests don't change
+between the fake and a real hub board; they run against the ESP32-SERVER
 plugin either way.
 
 ## Actions
@@ -68,23 +68,23 @@ plugin either way.
 | `clear` | — | The board dropped every rule and directive | 10 s |
 
 Everything here runs on the sensor board; hub-board and fake-server behaviour
-(`forget`, HTTP rules, hub `factory-reset`) belongs to the esp32-server plugin's
+(`forget`, HTTP rules, hub `factory-reset`) belongs to the ESP32-SERVER plugin's
 ACTIONS.md.
 
 ## Starting a test
 
 Start every app test from factory settings, then let the app find the board.
 With a server (hub-protocol.md section 7), reset both — hub steps hit the
-esp32-server plugin, sensor steps hit this one — provision the sensor, then
+ESP32-SERVER plugin, sensor steps hit this one — provision the sensor, then
 state how the server answers the app:
 
 ```
-PLUGIN: esp32-server factory-reset
-PLUGIN: esp32-sensor factory-reset
-PLUGIN: esp32-sensor ble-advertise seconds=0
+ESP32-SERVER: factory-reset
+ESP32-SENSOR: factory-reset
+ESP32-SENSOR: ble-advertise seconds=0
 # …the app finds BLE device BJF-<mac> and provisions the sensor; the sensor
 # reports to the server (the fake one when no hub board is attached)…
-PLUGIN: esp32-server expect
+ESP32-SERVER: expect
   GET /devices -> sequence 17 18 19
 END
 ```
@@ -92,8 +92,8 @@ END
 Before servers (one sensor board serving HTTP itself) it was just:
 
 ```
-PLUGIN: esp32-sensor factory-reset
-PLUGIN: esp32-sensor ble-advertise seconds=0
+ESP32-SENSOR: factory-reset
+ESP32-SENSOR: ble-advertise seconds=0
 ```
 
 `factory-reset` erases the provisioned network (the board falls back to the
@@ -114,13 +114,13 @@ The test's inline block states **only what changes** in how the board answers
 the app. Everything not mentioned stays as it was:
 
 ```
-PLUGIN: esp32-sensor expect
+ESP32-SENSOR: expect
   # the sensor breaks, and provisioning starts failing
   GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,"ok":false,"err":1,"ip":"{ip}"}
   POST /setup -> 500
 END
 VERIFY: The temperature card shows a sensor error
-PLUGIN: esp32-sensor expect
+ESP32-SENSOR: expect
   # the sensor recovers; /setup keeps failing
   GET /temperature.json -> normal
 END
@@ -139,23 +139,23 @@ sensor rejects HTTP rules (`no HTTP server; set rules on the hub`) and takes
 the directives `report on|off` (stop/start `POST /report`, so the server sees it
 go offline), `temp <t1> [<t2> …]` (report these values in turn instead of the
 probe; 1-8 values, -55..125), `temp normal`, plus `wifi`/`mqtt on|off`. HTTP
-rules go to the server — the esp32-server plugin, for `/devices`, `/devices/<mac>`,
+rules go to the server — the ESP32-SERVER plugin, for `/devices`, `/devices/<mac>`,
 `/devices/<mac>/history`, `/info.json` and `POST /report` (e.g.
 `POST /report -> 500` makes the server refuse sensors):
 
 ```
-PLUGIN: esp32-server expect
+ESP32-SERVER: expect
   GET /devices -> 200 []
 END
 VERIFY: The dashboard shows no sensors
-PLUGIN: esp32-sensor expect
+ESP32-SENSOR: expect
   report off
 END
 ```
 
 The fake server's rule language (the same as the hub firmware's: `<METHOD> <path> ->
 <status> [<body>]`, `hang`, `delay <ms> <status> [<body>]`, `sequence <t1> …`,
-`normal`) and its limits live in the esp32-server plugin's ACTIONS.md. A sensor
+`normal`) and its limits live in the ESP32-SERVER plugin's ACTIONS.md. A sensor
 rejects server directives (`wifi`, `mqtt` are its own `on|off`; HTTP rules get
 the `no HTTP server` rejection).
 
@@ -178,7 +178,7 @@ sent.
 | `unsupported` | failed | `ble-advertise` on firmware without `prov-start` (`unknown command`) |
 | `not_ready` | failed | No `@mt - ready` after a reset or flash |
 | `bad_request` | error | `script` has no rule lines |
-| `wrong_plugin` | (HTTP 404 on `POST /jobs`) | `device=hub`/`server`: belongs to the esp32-server plugin |
+| `wrong_plugin` | (HTTP 404 on `POST /jobs`) | `device=hub`/`server`: belongs to the ESP32-SERVER plugin |
 | `bad_firmware` | error | `firmware_dir` has no usable `flasher_args.json` or images |
 | `flash_failed`, `reset_failed`, `tool_missing` | error | esptool failed (flashing, or resetting a port that has no RTS pin) or isn't installed |
 | `port_closed`, `port_error` | error | The serial port went away |
