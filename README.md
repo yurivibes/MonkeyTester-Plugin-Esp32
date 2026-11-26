@@ -1,6 +1,6 @@
 # MonkeyTester-Plugin-Esp32
 
-The `esp32-sensor` device plugin for
+The `ESP32-SENSOR` device plugin for
 MonkeyTester. It owns
 the **`role: sensor`** ESP32 boards plugged into its host, flashes prebuilt
 firmware onto them, and relays a test's expectations (how the board should
@@ -9,7 +9,7 @@ answer the app: a broken sensor reading, an HTTP error, a hang, going offline,
 
 Hub/server boards and the fake software server are **not here**: they belong to
 the sibling plugin MonkeyTester-Plugin-Server
-(`esp32-server`, on :8093). The two plugins discover the same nodes but split
+(`ESP32-SERVER`, on :8093). The two plugins discover the same nodes but split
 them by role: each probes a board's firmware `status`, keeps only its own role,
 and shares the boards through per-node console locks and a role cache, so two
 plugin processes never open the same serial console.
@@ -24,15 +24,15 @@ which that firmware's `…-test` builds include.
 MonkeyTester ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or macOS)
                                      ├── esptool ───────────► flash
                                      └── serial (MT control) ► ESP32 sensor boards
-                                        (hub/server boards → esp32-server plugin :8093)
+                                        (hub/server boards → ESP32-SERVER plugin :8093)
 ```
 
 A board's **role** (`sensor` or `hub`, from its firmware's status; see
 `docs/hub-protocol.md` in the server firmware) decides which plugin owns it.
 Here, `device=sensor` (the default) or `device=<mac>`; `device=hub`/`server` is
-answered with `wrong_plugin` — run the step against the esp32-server plugin
+answered with `wrong_plugin` — run the step against the ESP32-SERVER plugin
 instead. When this plugin finds a hub board it drops it and releases its
-console lock so esp32-server can adopt it.
+console lock so ESP32-SERVER can adopt it.
 
 ## Install
 
@@ -123,7 +123,7 @@ advertises it as `"docs": "/docs"`, and the field is omitted when README.md
 can't be read next to `plugin_server.py` (then `/docs` answers 404). The Nix
 package ships the whole checkout, README.md included. The viewer shows a
 **Documentation** link under the plugin's address on its /plugins page when the
-field is there and fetches the page through its own `/plugins/docs/esp32-sensor`
+field is there and fetches the page through its own `/plugins/docs/ESP32-SENSOR`
 route with the saved token.
 
 On Linux the user needs to be in the `dialout` group. Boards are found by globbing
@@ -137,13 +137,13 @@ answers anything: its USB serial number is the board's MAC. Every environment
 variable is listed at the top of `esp32_plugin.py`, including
 `ESP32_LOCK_DIR` (default `/tmp/mt-esp32-locks`) and `ESP32_ROLE_CACHE`
 (default `/tmp/mt-esp32-roles.json`) — the board-ownership files **shared**
-with the esp32-server plugin: keep both plugins' settings of them in sync.
+with the ESP32-SERVER plugin: keep both plugins' settings of them in sync.
 
 ### Network access and the token
 
 The plugin API listens on **127.0.0.1 only** by default (`PLUGIN_BIND`), which is
 all the viewer needs when it runs on the same host (it reaches the plugin at
-`http://127.0.0.1:8091`). The sibling esp32-server plugin has the same defaults.
+`http://127.0.0.1:8091`). The sibling ESP32-SERVER plugin has the same defaults.
 
 To reach the plugin from another machine, bind it to a LAN address **and** set a
 token, or it refuses to start (exit code 2, with the reason on stderr):
@@ -168,7 +168,7 @@ symlinks out of those roots are refused. Details and limits: [SECURITY.md](SECUR
 
 To keep it running: `packaging/systemd/monkeytester-esp32-sensor.service` (Linux,
 user unit) or `packaging/launchd/com.blackjackfruit.monkeytester-esp32-sensor.plist`
-(macOS LaunchAgent). Run the esp32-server plugin's unit alongside it; the split
+(macOS LaunchAgent). Run the ESP32-SERVER plugin's unit alongside it; the split
 happens by itself through the lock files and role cache.
 
 ### Start and stop
@@ -227,29 +227,34 @@ curl -s -XPOST localhost:8091/jobs -H 'Content-Type: application/json' \
 ### Pointing MonkeyTester at it
 
 ```bash
-MT_PLUGINS=esp32-sensor=http://<plugin-host>:8091,esp32-server=http://<plugin-host>:8093
+MT_PLUGINS=ESP32-SENSOR=http://<plugin-host>:8091,ESP32-SERVER=http://<plugin-host>:8093
 ```
 
 (`<plugin-host>` is `127.0.0.1` when the viewer runs on the same host, which is
 the default setup; anything else needs `PLUGIN_BIND` + `PLUGIN_TOKEN` as above.)
 
+Plugin names are always uppercase: this plugin reports `ESP32-SENSOR` in `/health`
+`plugin.name`, and the viewer rejects lowercase names. A test step's command
+is the plugin name, like a built-in verb: `ESP32-SENSOR: <action> [key=value …]`
+(the old `PLUGIN: <name> <action>` form is a parse error).
+
 and, in a test (sensor steps hit this plugin; hub/server steps hit the
 other one):
 
 ```
-PLUGIN: esp32-server factory-reset
-PLUGIN: esp32-sensor factory-reset
-PLUGIN: esp32-sensor ble-advertise seconds=0
+ESP32-SERVER: factory-reset
+ESP32-SENSOR: factory-reset
+ESP32-SENSOR: ble-advertise seconds=0
 # … the app provisions the sensor over BLE (BJF-<mac>); it reports to the server …
-PLUGIN: esp32-server expect
+ESP32-SERVER: expect
   GET /devices -> sequence 17 18 19
 END
-VERIFY: The dashboard shows 17 °C
-PLUGIN: esp32-sensor expect
+AI: VERIFY The dashboard shows 17 °C
+ESP32-SENSOR: expect
   report off
 END
-VERIFY: The sensor shows as offline
-PLUGIN: esp32-server clear
+AI: VERIFY The sensor shows as offline
+ESP32-SERVER: clear
 ```
 
 ## What it does
@@ -271,7 +276,7 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
   `upload:<id>` instead (only `.bin` and `.json` files are unpacked).
 - **expect** is a relay: the test's inline block goes to the board line by line
   as rules (`report`/`temp`/`wifi` directives on a sensor; HTTP response rules
-  belong to the esp32-server plugin). A block states only what changes; earlier
+  belong to the ESP32-SERVER plugin). A block states only what changes; earlier
   rules stay until overridden, undone with `-> normal`, or dropped with `clear`.
   The plugin doesn't know the rule language; the firmware does. A new failure
   case is a few lines in a test, with no plugin change.
@@ -294,4 +299,4 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 | `security.py` | Bind/token policy and request-input validators (MAC, serial port, job/upload ids, contained paths); identical in both ESP32 plugin repos. See [SECURITY.md](SECURITY.md). |
 | `esp32_plugin.py` | Board discovery, role ownership, actions, flashing, `main()` |
 | `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, MT control requests, reset |
-| `tests/` | Contract and action tests with a fake board (`fake_board.py`: pre-role and sensor firmware, and a fake USJ port whose node index moves after the fake esptool resets), a fake esptool, and `test_ownership.py` for the board/role split against esp32-server |
+| `tests/` | Contract and action tests with a fake board (`fake_board.py`: pre-role and sensor firmware, and a fake USJ port whose node index moves after the fake esptool resets), a fake esptool, and `test_ownership.py` for the board/role split against ESP32-SERVER |

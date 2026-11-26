@@ -151,7 +151,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(h["contract"], "monkeytester-plugin")
         self.assertEqual(h["contract_version"], 1)
-        self.assertEqual(h["plugin"]["name"], "esp32-sensor")
+        self.assertEqual(h["plugin"]["name"], "ESP32-SENSOR")
         self.assertEqual(h["devices"], 1)
         self.assertIn("events", h["capabilities"])
 
