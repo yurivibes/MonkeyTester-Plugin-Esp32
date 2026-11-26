@@ -16,14 +16,14 @@ plugin processes never open the same serial console.
 
 MonkeyTester reaches it only through the shared **Device Plugin API**
 (`PLUGIN_API.md` in the MonkeyTester repo). Boards are driven over their serial
-console with the **VT control protocol** (`docs/vt-control.md` in
+console with the **MT control protocol** (`docs/mt-control.md` in
 the sensor firmware),
 which that firmware's `…-test` builds include.
 
 ```
 MonkeyTester ──HTTP (plugin API)──► esp32_plugin.py :8091 (Linux or macOS)
                                      ├── esptool ───────────► flash
-                                     └── serial (VT control) ► ESP32 sensor boards
+                                     └── serial (MT control) ► ESP32 sensor boards
                                         (hub/server boards → esp32-server plugin :8093)
 ```
 
@@ -125,8 +125,8 @@ CP2102N UART bridge (`/dev/ttyUSB*`) or over its own USB-Serial-JTAG interface
 with the node it is on. The native interface identifies the board before it
 answers anything: its USB serial number is the board's MAC. Every environment
 variable is listed at the top of `esp32_plugin.py`, including
-`ESP32_LOCK_DIR` (default `/tmp/vt-esp32-locks`) and `ESP32_ROLE_CACHE`
-(default `/tmp/vt-esp32-roles.json`) — the board-ownership files **shared**
+`ESP32_LOCK_DIR` (default `/tmp/mt-esp32-locks`) and `ESP32_ROLE_CACHE`
+(default `/tmp/mt-esp32-roles.json`) — the board-ownership files **shared**
 with the esp32-server plugin: keep both plugins' settings of them in sync.
 
 ### Network access and the token
@@ -148,7 +148,7 @@ With a token set, every request except `GET /health` needs the
 `X-Plugin-Token` header (401 otherwise); on loopback the token is optional and,
 when set, enforced the same way. The viewer keeps each plugin's token in
 **Settings → Device Plugins** (MonkeyTester PR in progress; until it lands, the
-viewer's `PLUGIN_TOKEN` / `VT_PLUGIN_TOKEN_<NAME>` environment). There is no
+viewer's `PLUGIN_TOKEN` / `MT_PLUGIN_TOKEN_<NAME>` environment). There is no
 TLS: use a VPN or Tailscale to reach the plugin across untrusted networks.
 
 `flash` only reads firmware from `ESP32_FIRMWARE_ROOT` (default: the working
@@ -217,7 +217,7 @@ curl -s -XPOST localhost:8091/jobs -H 'Content-Type: application/json' \
 ### Pointing MonkeyTester at it
 
 ```bash
-VT_PLUGINS=esp32-sensor=http://<plugin-host>:8091,esp32-server=http://<plugin-host>:8093
+MT_PLUGINS=esp32-sensor=http://<plugin-host>:8091,esp32-server=http://<plugin-host>:8093
 ```
 
 (`<plugin-host>` is `127.0.0.1` when the viewer runs on the same host, which is
@@ -272,7 +272,7 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
   Soft-AP provisioning builds use **broadcast-ssid** (`ap-start`) instead.
 
 Job outcomes follow the contract: `passed`; `failed` when the board rejected a
-rule or didn't answer over VT control; `timeout`; `error` when the plugin itself
+rule or didn't answer over MT control; `timeout`; `error` when the plugin itself
 couldn't do it (bad firmware dir, esptool failure, port gone).
 
 ## Layout
@@ -282,5 +282,5 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 | `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads. No ESP32 code. |
 | `security.py` | Bind/token policy and request-input validators (MAC, serial port, job/upload ids, contained paths); identical in both ESP32 plugin repos. See [SECURITY.md](SECURITY.md). |
 | `esp32_plugin.py` | Board discovery, role ownership, actions, flashing, `main()` |
-| `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, VT control requests, reset |
+| `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, MT control requests, reset |
 | `tests/` | Contract and action tests with a fake board (`fake_board.py`: pre-role and sensor firmware, and a fake USJ port whose node index moves after the fake esptool resets), a fake esptool, and `test_ownership.py` for the board/role split against esp32-server |

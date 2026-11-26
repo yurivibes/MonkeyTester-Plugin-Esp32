@@ -8,9 +8,9 @@ parameter schemas.
 
 This plugin owns the **`role: sensor`** boards only (the server firmware's
 `docs/hub-protocol.md` sections 6 and 7 name the roles; the project calls the
-`role: hub` boards "server"). Each board's `status` / `@vt - ready` line says
+`role: hub` boards "server"). Each board's `status` / `@mt - ready` line says
 `"role":"sensor"` or `"role":"hub"`; firmware from before roles (no `role`
-field), and boards that don't answer VT control, count as sensors. A node that
+field), and boards that don't answer MT control, count as sensors. A node that
 answers with the other role is probed, dropped and its console lock released so
 the esp32-server plugin adopts it; the shared role cache keeps the next scan
 from touching it.
@@ -39,7 +39,7 @@ reported as `details.port_kind`):
 | `uart-bridge` | `/dev/ttyUSB*` (macOS `cu.usbserial*`): the CP2102N adapter | a baud rate (`ESP32_BAUD`, `ESP32_FLASH_BAUD`) and an EN/RTS pin to pulse |
 | `usb-serial-jtag` | `/dev/ttyACM*` (macOS `cu.usbmodem*`): the chip's own interface | nothing to set (CDC-ACM ignores the baud rate and has no DTR/RTS, so the plugin touches neither), no pin to reset through, and a USB serial number that **is the board's MAC** (`AC:27:6E:FA:BB:5C` in udev's by-id name) |
 
-A native board is therefore identified at discovery, before it answers VT
+A native board is therefore identified at discovery, before it answers MT
 control. It has no reset button on the wire: `reset` runs esptool on that port,
 which ends with its own hard reset. esptool may make the kernel re-create the
 interface with another index (`/dev/ttyACM0` becomes `/dev/ttyACM1`), so the
@@ -59,8 +59,8 @@ plugin either way.
 
 | Action | Params | Passes when | Default timeout |
 |---|---|---|---|
-| `flash` | `firmware_dir` (path, required: under `ESP32_FIRMWARE_ROOT`/`ESP32_FIRMWARE_ROOTS`/`/nix/store`, or `upload:<id>`; anything else is a 400, see SECURITY.md), `erase` (bool, false), `wait_ready` (bool, true), `baud` (int; ignored on a native port) | esptool succeeds and, with `wait_ready`, the board prints `@vt - ready` (or answers `status`) after reboot | 180 s |
-| `reset` | `wait_ready` (bool, true) | The board reboots — EN is pulsed through the adapter's RTS pin on a `uart-bridge` port, esptool's own hard reset on a native `usb-serial-jtag` one — and prints `@vt - ready`. A reboot drops every rule | 30 s |
+| `flash` | `firmware_dir` (path, required: under `ESP32_FIRMWARE_ROOT`/`ESP32_FIRMWARE_ROOTS`/`/nix/store`, or `upload:<id>`; anything else is a 400, see SECURITY.md), `erase` (bool, false), `wait_ready` (bool, true), `baud` (int; ignored on a native port) | esptool succeeds and, with `wait_ready`, the board prints `@mt - ready` (or answers `status`) after reboot | 180 s |
+| `reset` | `wait_ready` (bool, true) | The board reboots — EN is pulsed through the adapter's RTS pin on a `uart-bridge` port, esptool's own hard reset on a native `usb-serial-jtag` one — and prints `@mt - ready`. A reboot drops every rule | 30 s |
 | `factory-reset` | — | The board forgets its provisioned Wi-Fi network, reboots, and comes back ready with no rules | 30 s |
 | `broadcast-ssid` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board reports its provisioning SSID (`BJF-<mac>`) is broadcasting; `result.ssid` is the name | 10 s |
 | `ble-advertise` | `seconds` (int; 0 = until provisioned or reboot; default: the firmware's `PROVISION_TIMEOUT_S`) | The board answers `prov-start` and reports BLE provisioning is on; `result.name` is its BLE name (`BJF-<mac>`), `result.transport` is `ble`. Needs firmware with `prov-start` | 10 s |
@@ -127,8 +127,8 @@ END
 ```
 
 For a board, the plugin doesn't interpret the rules. It drops blank and `#`
-lines and sends each line as `rule <line>` over the VT control protocol, nothing
-else. The rule language belongs to the firmware: `docs/vt-control.md` in the sensor firmware
+lines and sends each line as `rule <line>` over the MT control protocol, nothing
+else. The rule language belongs to the firmware: `docs/mt-control.md` in the sensor firmware
 (HTTP responses with a status and body, `hang`, `delay`, `sequence` for a
 reading whose temperature moves on with each request, `normal` to undo one
 rule, and `wifi`/`mqtt` directives). A later rule for the same method and path
@@ -171,12 +171,12 @@ sent.
 | Code | State | Meaning |
 |---|---|---|
 | `rule_rejected` | failed | The firmware rejected a rule line (`result.line`, `result.error`) |
-| `no_reply` | failed | No VT reply in time: hung firmware or a build without `VT_CONTROL` |
+| `no_reply` | failed | No MT reply in time: hung firmware or a build without `MT_CONTROL` |
 | `device_error` | failed | The firmware answered `err` to `clear`, `ap-start` or `prov-start` |
 | `unknown_device` | (HTTP 404 on `POST /jobs`) | `device=` matched nothing: no sensor attached, or an unknown MAC/port |
 | `wrong_transport` | failed | `ble-advertise` on a soft-AP build: use `broadcast-ssid` |
 | `unsupported` | failed | `ble-advertise` on firmware without `prov-start` (`unknown command`) |
-| `not_ready` | failed | No `@vt - ready` after a reset or flash |
+| `not_ready` | failed | No `@mt - ready` after a reset or flash |
 | `bad_request` | error | `script` has no rule lines |
 | `wrong_plugin` | (HTTP 404 on `POST /jobs`) | `device=hub`/`server`: belongs to the esp32-server plugin |
 | `bad_firmware` | error | `firmware_dir` has no usable `flasher_args.json` or images |
