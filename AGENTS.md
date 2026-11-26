@@ -2,7 +2,7 @@
 
 ## Purpose
 The `esp32-sensor` device plugin for MonkeyTester: flashes prebuilt firmware
-onto the **sensor** ESP32 boards and drives them over the VT control serial
+onto the **sensor** ESP32 boards and drives them over the MT control serial
 protocol, behind the shared Device Plugin API. Hub/server boards and the fake
 software server are the sibling plugin's (MonkeyTester-Plugin-Server, `esp32-server`,
 :8093). See README.md.
@@ -28,7 +28,7 @@ anything; that section is the single source for them. In short:
   job states or fields here without changing that document first (and bumping
   `contract_version` for breaking changes).
 - **The device protocol is owned by the firmware.** Board commands and the rule
-  language follow `docs/vt-control.md` in the sensor firmware and
+  language follow `docs/mt-control.md` in the sensor firmware and
   `docs/hub-protocol.md` in the server firmware (roles, hub API, sections 6-7).
   For boards, `expect` relays rule lines without interpreting them; don't add
   parsing or validation of board rules here.
@@ -36,8 +36,8 @@ anything; that section is the single source for them. In short:
   probed, dropped and its console lock released so esp32-server adopts it; the
   shared role cache keeps the next scan from touching it again. Hub actions
   (`forget`) and the fake server live in the other repo — don't move them back.
-  The lock dir and role cache defaults (`/tmp/vt-esp32-locks`,
-  `/tmp/vt-esp32-roles.json`) must match esp32-server's exactly: they are the
+  The lock dir and role cache defaults (`/tmp/mt-esp32-locks`,
+  `/tmp/mt-esp32-roles.json`) must match esp32-server's exactly: they are the
   cross-process protocol.
 - **Two transports, one protocol.** A board is either on a CP2102N UART bridge
   (`uart-bridge`, `/dev/ttyUSB*`) or on its own USB-Serial-JTAG interface
