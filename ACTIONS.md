@@ -119,7 +119,7 @@ ESP32-SENSOR: expect
   GET /temperature.json -> 200 {"device":"{device}","temperature_c":0,"ok":false,"err":1,"ip":"{ip}"}
   POST /setup -> 500
 END
-VERIFY: The temperature card shows a sensor error
+AI: VERIFY The temperature card shows a sensor error
 ESP32-SENSOR: expect
   # the sensor recovers; /setup keeps failing
   GET /temperature.json -> normal
@@ -147,7 +147,7 @@ rules go to the server — the ESP32-SERVER plugin, for `/devices`, `/devices/<m
 ESP32-SERVER: expect
   GET /devices -> 200 []
 END
-VERIFY: The dashboard shows no sensors
+AI: VERIFY The dashboard shows no sensors
 ESP32-SENSOR: expect
   report off
 END

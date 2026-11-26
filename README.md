@@ -249,11 +249,11 @@ ESP32-SENSOR: ble-advertise seconds=0
 ESP32-SERVER: expect
   GET /devices -> sequence 17 18 19
 END
-VERIFY: The dashboard shows 17 °C
+AI: VERIFY The dashboard shows 17 °C
 ESP32-SENSOR: expect
   report off
 END
-VERIFY: The sensor shows as offline
+AI: VERIFY The sensor shows as offline
 ESP32-SERVER: clear
 ```
 
