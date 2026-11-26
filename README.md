@@ -116,6 +116,16 @@ nix run                          # plugin on 127.0.0.1:8091 (loopback only)
 
 Check it with `curl localhost:8091/health` and `curl localhost:8091/devices`.
 
+`GET /docs` serves this README as a self-contained HTML page
+(`curl localhost:8091/docs`, or open it in a browser); with a token set it
+needs the `X-Plugin-Token` header like every route but `/health`. `GET /health`
+advertises it as `"docs": "/docs"`, and the field is omitted when README.md
+can't be read next to `plugin_server.py` (then `/docs` answers 404). The Nix
+package ships the whole checkout, README.md included. The viewer shows a
+**Documentation** link under the plugin's address on its /plugins page when the
+field is there and fetches the page through its own `/plugins/docs/esp32-sensor`
+route with the saved token.
+
 On Linux the user needs to be in the `dialout` group. Boards are found by globbing
 the usual USB ports (`/dev/serial/by-id/*`, `/dev/ttyUSB*`, `/dev/ttyACM*` on Linux;
 `/dev/cu.usbserial-*`, `/dev/cu.SLAB_USBtoUART*`, `/dev/cu.usbmodem*` on macOS)
@@ -279,7 +289,8 @@ couldn't do it (bad firmware dir, esptool failure, port gone).
 
 | File | What |
 |---|---|
-| `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads. No ESP32 code. |
+| `plugin_server.py` | The generic plugin API server: jobs, long-poll waits, events, uploads, `GET /docs`. No ESP32 code. |
+| `docs_page.py` | Renders README.md as the `GET /docs` HTML page. A verbatim copy shared by every MonkeyTester plugin: don't edit it here. |
 | `security.py` | Bind/token policy and request-input validators (MAC, serial port, job/upload ids, contained paths); identical in both ESP32 plugin repos. See [SECURITY.md](SECURITY.md). |
 | `esp32_plugin.py` | Board discovery, role ownership, actions, flashing, `main()` |
 | `board.py` | One board on one serial port: its transport (`port_kind`: UART bridge or native USB-Serial-JTAG), reader thread, MT control requests, reset |

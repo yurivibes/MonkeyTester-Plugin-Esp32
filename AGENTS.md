@@ -52,6 +52,11 @@ anything; that section is the single source for them. In short:
 - **No test logic.** The plugin doesn't know about apps or vision models; it only
   makes boards do things and reports whether they did.
 - Keep ACTIONS.md in step with `_build_actions()`.
+- **`GET /docs` renders README.md** (via `docs_page.py`, resolved next to
+  `plugin_server.py`), so README.md is user-facing documentation served by the
+  plugin itself. `/health` advertises `"docs": "/docs"` only while README.md is
+  readable. `docs_page.py` is a verbatim copy shared by every MonkeyTester
+  plugin: don't edit it here; report renderer bugs instead.
 - **Keep the user informed of user-relevant changes.** A change is user-relevant
   when it changes what a person running the plugin by hand does or sees: how to
   install, start, stop or restart it (systemd unit, LaunchAgent, `nix run`),
