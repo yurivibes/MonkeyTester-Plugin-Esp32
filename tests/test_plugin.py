@@ -322,6 +322,25 @@ class ActionTests(unittest.TestCase):
         job = self.h.run("expect", {"script": "GET /temperature.json -> sequence 17 hot"})
         self.assertEqual(job["state"], "failed", job)
 
+    def test_scan_rule_with_quoted_ssid_is_relayed_unchanged(self):
+        # A hub-era sensor board (BLE build): the `scan` directive's quotes
+        # must reach the firmware byte for byte.
+        h = Harness(roles=("sensor",), transport="ble")
+        self.addCleanup(h.close)
+        fw = h.fws["/dev/fake0"]
+        job = h.run("expect", {"script": '  scan HoneyPot Neighbor-2G "Cafe Guest"  \n'})
+        self.assertEqual(job["state"], "passed", job)
+        sent = [l.split(" ", 2)[2] for l in fw.received if l.startswith("@mt p")]
+        self.assertEqual(sent[-1], 'rule scan HoneyPot Neighbor-2G "Cafe Guest"')
+        self.assertEqual(fw.scan, ["HoneyPot", "Neighbor-2G", "Cafe Guest"])
+        job = h.run("expect", {"script": 'scan "Cafe Guest'})
+        self.assertEqual(job["state"], "failed", job)
+        self.assertEqual(job["error"]["code"], "rule_rejected")
+        self.assertEqual(job["result"]["error"], "unterminated quote in ssid")
+        job = h.run("expect", {"script": "scan normal"})
+        self.assertEqual(job["state"], "passed", job)
+        self.assertIsNone(fw.scan)
+
     def test_rejected_rule_stops_and_keeps_earlier_state(self):
         self.h.run("expect", {"script": "GET /old -> 500"})
         job = self.h.run("expect", {"script": "GET /a -> 500\nGET /b => 500\nGET /c -> 500"})

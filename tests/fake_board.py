@@ -11,6 +11,7 @@ left is esptool's own; UsjNodes models the ttyACM index moving after that reset.
 
 import json
 import os
+import shlex
 import threading
 import time
 
@@ -54,6 +55,7 @@ class FakeFirmware:
         self.mqtt = "on"
         self.report = "on"
         self.temps = None  # `temp` directive values; None = the probe
+        self.scan = None   # `scan` directive SSIDs; None = the real scan
 
     hub_host = "tshub-fake.local:8092"
     last_report = "ok"
@@ -135,6 +137,20 @@ class FakeFirmware:
                     if not -55 <= t <= 125:
                         raise ValueError("bad temp value")
                 self.temps = [float(v) for v in vals]
+                return
+            if words and words[0] == "scan":
+                rest = line.split(None, 1)[1] if len(words) > 1 else ""
+                if not rest:
+                    raise ValueError("missing scan ssids")
+                if words[1:] == ["normal"]:
+                    self.scan = None
+                    return
+                if rest.count('"') % 2:
+                    raise ValueError("unterminated quote in ssid")
+                ssids = shlex.split(rest)
+                if not 1 <= len(ssids) <= 8:
+                    raise ValueError("too many ssids (max 8)")
+                self.scan = ssids
                 return
             if len(words) >= 2 and words[0] in ("GET", "POST", "ANY"):
                 raise ValueError(SENSOR_NO_HTTP)

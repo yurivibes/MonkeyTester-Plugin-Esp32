@@ -275,7 +275,9 @@ See [ACTIONS.md](ACTIONS.md) for the actions (`flash`, `reset`,
   when MonkeyTester runs elsewhere it can `POST /uploads` a zip of it and pass
   `upload:<id>` instead (only `.bin` and `.json` files are unpacked).
 - **expect** is a relay: the test's inline block goes to the board line by line
-  as rules (`report`/`temp`/`wifi` directives on a sensor; HTTP response rules
+  as rules (`report`/`temp`/`scan`/`wifi` directives on a sensor — `scan
+  HoneyPot "Cafe Guest"` fixes the network list the app sees while
+  provisioning; HTTP response rules
   belong to the ESP32-SERVER plugin). A block states only what changes; earlier
   rules stay until overridden, undone with `-> normal`, or dropped with `clear`.
   The plugin doesn't know the rule language; the firmware does. A new failure
