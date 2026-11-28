@@ -138,7 +138,11 @@ replaces the earlier one.
 sensor rejects HTTP rules (`no HTTP server; set rules on the hub`) and takes
 the directives `report on|off` (stop/start `POST /report`, so the server sees it
 go offline), `temp <t1> [<t2> …]` (report these values in turn instead of the
-probe; 1-8 values, -55..125), `temp normal`, plus `wifi`/`mqtt on|off`. HTTP
+probe; 1-8 values, -55..125), `temp normal`, `scan <ssid> [<ssid> …]` (the
+board's provisioning Wi-Fi scan — BLE `prov-scan` — answers exactly these
+networks, strongest first, instead of scanning the air; 1-8 SSIDs of 1-32
+bytes, an SSID with a blank double-quoted), `scan normal` (the real scan
+again), plus `wifi`/`mqtt on|off`. HTTP
 rules go to the server — the ESP32-SERVER plugin, for `/devices`, `/devices/<mac>`,
 `/devices/<mac>/history`, `/info.json` and `POST /report` (e.g.
 `POST /report -> 500` makes the server refuse sensors):
@@ -152,6 +156,25 @@ ESP32-SENSOR: expect
   report off
 END
 ```
+
+A provisioning test pins the "Choose a network" list so it is the same on every
+run. Set it after `factory-reset` (a reboot or `clear` drops it) and list the
+network the app will really join (the board connects to whatever it is given,
+listed or not):
+
+```
+ESP32-SENSOR: factory-reset
+ESP32-SENSOR: expect
+  scan HoneyPot Neighbor-2G "Cafe Guest"
+END
+ESP32-SENSOR: ble-advertise seconds=0
+# …the app's network list shows HoneyPot, Neighbor-2G, Cafe Guest in that order…
+```
+
+The plugin relays the line as is, quotes included; the firmware parses it
+(`docs/mt-control.md`, "Directives", in the sensor firmware) and rejects a bad
+line with `rule_rejected` (`result.error`: e.g. `unterminated quote in ssid`,
+`ssid too long (max 32 bytes)`, `too many ssids (max 8)`).
 
 The fake server's rule language (the same as the hub firmware's: `<METHOD> <path> ->
 <status> [<body>]`, `hang`, `delay <ms> <status> [<body>]`, `sequence <t1> …`,
